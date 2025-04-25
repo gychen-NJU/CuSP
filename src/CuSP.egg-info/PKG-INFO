@@ -1,0 +1,14 @@
+Metadata-Version: 2.4
+Name: CuSP
+Version: 0.1.0
+Summary: Cuda-supported SpectroPolarimetry
+Author: Chen Guoyin
+Author-email: gychen@smail.nju.edu.cn
+Requires-Dist: torch>=1.13.1
+Requires-Dist: numpy>=1.24.3
+Requires-Dist: matplotlib>=3.7.2
+Requires-Dist: scipy>=1.11.3
+Dynamic: author
+Dynamic: author-email
+Dynamic: requires-dist
+Dynamic: summary
