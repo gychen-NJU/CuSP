@@ -13,6 +13,10 @@ CuSP is a high-performance spectropolarimetry toolkit leveraging CUDA accelerati
 - NVIDIA GPU (CUDA-enabled recommended) or CPU
 - PyTorch >=1.13.1
 
+### From PyPI (Recommended)
+```
+pip install CuSP
+
 ### From Source
 ```bash
 git clone https://github.com/gychen-NJU/CuSP.git
