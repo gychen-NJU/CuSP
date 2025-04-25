@@ -16,6 +16,7 @@ CuSP is a high-performance spectropolarimetry toolkit leveraging CUDA accelerati
 ### From PyPI (Recommended)
 ```bash
 pip install CuSP
+```
 
 ### From Source
 ```bash
