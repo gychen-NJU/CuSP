@@ -1,0 +1,22 @@
+# Python 相关
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 环境相关
+.env
+.venv
+venv/
+env/
+
+# IDE 相关
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 构建产物
+*.egg-info/
+dist/
+build/
