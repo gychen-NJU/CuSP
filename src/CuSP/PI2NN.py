@@ -125,13 +125,13 @@ class FCN(nn.Module):
         return self.layers(x)
 
 class InversionNet(nn.Module):
-    def __init__(self, layers=[3 * 32, 8], use_attention=True, use_batchnorm=True, use_residual=True):
+    def __init__(self, layers=[3 * 32, 8], use_attention=True, use_batchnorm=True, use_residual=True,use_kqv=False):
         super(InversionNet, self).__init__()
         self.layers = layers
         self.conv1d = nn.Conv1d
         self.pool = nn.MaxPool1d(2, 2)
         self.flatten = nn.Flatten()
-        self.fcn = FCN(layers, use_attention=use_attention, use_batchnorm=use_batchnorm, use_residual=use_residual)
+        self.fcn = FCN(layers, use_attention=use_kqv, use_batchnorm=use_batchnorm, use_residual=use_residual)
         
         conv_blocks = []
         channels = [4, 16, 16, 16, 32, 32, 32]
