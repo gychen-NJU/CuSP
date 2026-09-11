@@ -8,7 +8,7 @@ setup(
     author_email='gychen@smail.nju.edu.cn',
     packages=find_packages(where='src'),
     package_dir={'': 'src'},
-    package_data={'CuSP': ['examples/*.ipynb']},
+    package_data={'CuSP': ['examples/*.ipynb', 'data/*.pkl']},
     include_package_data=True,
     install_requires=[
         'torch>=1.13.1',

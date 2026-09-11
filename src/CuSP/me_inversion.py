@@ -4,6 +4,9 @@ import time
 import matplotlib.pyplot as plt
 from .me_forward import MEForward
 from .annealing import DualAnnealing
+from .initial_guess import initial_guess_from_spectrum, PI2NNInitialGuess
+
+
 class MEInversion(MEForward):
     # Default range of parameters, ref: 10.1007/s11207-014-0497-7 (Centeno et al. 2014)
     v_D_range = [1.,500.]
@@ -189,6 +192,76 @@ class MEInversion(MEForward):
         plt.plot(lm,iquv_obs[0,3].cpu().numpy().squeeze(),label='V_observation',ls='',marker='o',ms=5)
         plt.legend()
     
+    def make_initial_guess(self, iquv_obs:torch.Tensor, initial_guess=None, device=None):
+        '''
+        Build the normalised (B,8) starting point of the annealing.
+
+        Parameters:
+        ===========
+            iquv_obs: torch.Tensor, observed IQUV with shape (B,4,N)
+            initial_guess: None | str | torch.Tensor | callable
+                None            -> uniform random guess (original behaviour)
+                'sdo_hmi'       -> the shipped PI2NN network for SDO/HMI
+                                   (any name registered via
+                                   `CuSP.register_initial_guess`, or a path to a
+                                   .pkl saved by `torch.save(PI2NN_instance, ...)`)
+                torch.Tensor    -> explicit guess in normalised parameter space,
+                                   shape (B,8) or (8,)
+                callable        -> f(iquv_obs, inversion=self) returning physical
+                                   (B,8) parameters or normalised ones
+            device: torch.device, device of the returned tensor
+
+        Returns:
+        ========
+            x_guess: torch.Tensor, normalised parameters with shape (B,8)
+        '''
+        n_batch = iquv_obs.size(0)
+        if device is None:
+            device = iquv_obs.device
+        if initial_guess is None or (isinstance(initial_guess, str)
+                                     and initial_guess.lower() in ('random', 'none')):
+            return torch.rand(n_batch, 8).float().to(device)
+
+        if torch.is_tensor(initial_guess):
+            x_guess = initial_guess.to(device=device)
+            if x_guess.dim() == 1:
+                x_guess = x_guess.unsqueeze(0).repeat(n_batch, 1)
+            if x_guess.shape != (n_batch, 8):
+                raise ValueError(
+                    f'initial_guess tensor must have shape ({n_batch},8) or (8,), '
+                    f'got {tuple(initial_guess.shape)}')
+            return x_guess.float()
+
+        if isinstance(initial_guess, str):
+            return initial_guess_from_spectrum(self, iquv_obs, model=initial_guess).to(device)
+
+        if isinstance(initial_guess, PI2NNInitialGuess):
+            return initial_guess_from_spectrum(self, iquv_obs, model=initial_guess).to(device)
+
+        if callable(initial_guess):
+            guess = initial_guess(iquv_obs, inversion=self, device=device)
+            if torch.is_tensor(guess):
+                guess = guess.to(device=device)
+                if guess.shape == (n_batch, 8):
+                    # a tensor of physical parameters is distinguished from a
+                    # normalised one by its range: normalised guesses live in [0,1]
+                    with torch.no_grad():
+                        in_unit_box = bool(((guess >= 0) & (guess <= 1)).all())
+                    if not in_unit_box:
+                        guess = self.normalizing_parameter(guess)
+                elif guess.dim() == 1 and guess.numel() == 8:
+                    guess = guess.unsqueeze(0).repeat(n_batch, 1)
+                else:
+                    raise ValueError(
+                        f'initial_guess callable returned shape {tuple(guess.shape)}, '
+                        f'expected ({n_batch},8)')
+                return guess.float()
+            raise TypeError(
+                'initial_guess callable must return a torch.Tensor of shape (B,8)')
+
+        raise ValueError(
+            f'Invalid initial_guess: {initial_guess!r}, support: None, str, torch.Tensor, callable')
+
     def __call__(self,iquv_obs:torch.Tensor,**kwargs):
         '''
         Input:
@@ -197,6 +270,15 @@ class MEInversion(MEForward):
         Parameters:
             method: str, optimization method, default: 'gsa', ['gsa','csa']
             device: torch.device, device, default: iquv_obs.device
+            initial_guess: None | str | torch.Tensor | callable, default: None
+                Starting point of the annealing.  None keeps the original
+                uniform-random guess; 'sdo_hmi' evaluates the shipped PI2NN
+                network on `iquv_obs` and uses its prediction (see
+                `CuSP.initial_guess`); a tensor is taken as normalised
+                parameters; a callable is called as
+                `f(iquv_obs, inversion=self, device=device)`.
+                `x_guess=` (normalised tensor) is still accepted and takes
+                precedence over `initial_guess`.
             Other parameters see `CudaAnnealing` if 'csa' or `DualAnnealing` if 'gsa'
         ====
         Output:
@@ -207,11 +289,18 @@ class MEInversion(MEForward):
         device = kwargs.get('device',iquv_obs.device)
         self.wavebands = self.wavebands.to(device)
         self.ivs_method = method
+        # starting point of the annealing: `x_guess` (normalised parameters) takes
+        # precedence over `initial_guess` (e.g. 'sdo_hmi' -> trained PI2NN network)
+        guess_spec = kwargs.pop('x_guess', None)
+        if guess_spec is None:
+            guess_spec = kwargs.pop('initial_guess', None)
+        else:
+            kwargs.pop('initial_guess', None)
+        x_guess = self.make_initial_guess(iquv_obs, guess_spec, device=device)
         if method == 'csa':
             kwargs.pop('method', None)
             iquv_obs = iquv_obs.to(device)
             func = lambda x, **kwargs: self.merit_function(iquv_obs,self.synthesize(self.denormalizing_parameter(x)),**kwargs)
-            x_guess = kwargs.pop('x_guess', torch.rand(iquv_obs.size(0), 8).float().to(device))
             optimizer = CudaAnnealing(func,x_guess,**kwargs)
             x_best,E_best = optimizer.optimizing(x_guess,**kwargs)
             self.optimizer = optimizer
@@ -228,7 +317,6 @@ class MEInversion(MEForward):
             max_batches = kwargs.pop('max_batches',int(1e10))
             if iquv_obs.size(0)<=max_batches:
                 func = lambda x, **kwargs: self.merit_function(iquv_obs,self.synthesize(self.denormalizing_parameter(x)),**kwargs)
-                x_guess = kwargs.pop('x_guess', torch.rand(iquv_obs.size(0), 8).float().to(device))
                 bounds = [[0.,1.]]*8
                 maxiter = kwargs.pop('max_iter', kwargs.pop('maxiter', 1000))
                 adam = kwargs.pop('adam', dict())
@@ -249,7 +337,6 @@ class MEInversion(MEForward):
                 )
             else:
                 params_ivs = []
-                x_guess = kwargs.pop('x_guess', torch.rand(iquv_obs.size(0), 8).float().to(device))
                 self.ivs_results = dict(
                     x0=self.denormalizing_parameter(x_guess).detach().cpu().numpy(),
                     e0=np.zeros((iquv_obs.size(0),1)),
@@ -463,7 +550,7 @@ class CudaAnnealing:
         step_type = kwargs.get('step_type', 'gradient')
         self.fixer = {}
         print(f' Epoch: {1:05d}, Temperature: {T:9.4f}, Energy: {E_current.min():.6e}, Time: {time_used:7.3f}m')
-        self.results['Emin_list'] = [E_init.min().item()]
+        self.results['Emin_list'] = [E_best.min().item()]
         while True:
             if T<Tf:
                 print(f'Encounter ending temperature: {T:7.2f}')

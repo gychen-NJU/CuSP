@@ -6,47 +6,34 @@ import os
 import glob
 import time
 
-def VoigtFaradayProfile(
-    u: torch.Tensor,
-    a: torch.Tensor,
-    ynodes=100,
-    lim=5.0,
-) -> torch.Tensor:
-    device = u.device
-    dtype = u.dtype
-    y = torch.linspace(-lim,lim,ynodes,device=device,dtype=dtype)
-    dy = y[1]-y[0]
-    u = u.unsqueeze(2)
-    a = a.unsqueeze(2)
-    y = y[None,None,:]
-    numerator = torch.exp(-y**2)*(u-y)
-    denominator = (u-y)**2+a**2
-    integrand = numerator/denominator
-    profile = (1/torch.pi**1.5)*torch.trapz(integrand,dx=dy,dim=-1)
-    return profile
+# --------------------------------------------------------------------------- #
+# Line profiles.
+#
+# `VoigtProfile` / `VoigtFaradayProfile` are the fast, quadrature-free
+# implementations from `.voigt` (complex rational approximation of the Faddeeva
+# function, as in `codes/voigt.py::voigt_profiles`).  Their names, call
+# signature and output shapes are unchanged, so every existing caller of
+# `CuSP.me_forward.VoigtProfile` keeps working.
+#
+# The previous fixed-grid trapezoidal quadrature is still available as
+# `VoigtProfileQuadrature` / `VoigtFaradayProfileQuadrature` (also re-exported
+# here) if a slow reference is ever needed again.
+# --------------------------------------------------------------------------- #
+from .voigt import (                       # noqa: E402  (kept next to its users)
+    VoigtProfile,
+    VoigtFaradayProfile,
+    VoigtProfileQuadrature,
+    VoigtFaradayProfileQuadrature,
+)
 
-def VoigtProfile(
-    u: torch.Tensor,
-    a: torch.Tensor,
-    ynodes=1000,
-    lim=10.0,
-) -> torch.Tensor:
-    device = u.device
-    dtype = u.dtype
-    y = torch.linspace(-lim,lim,ynodes,device=device,dtype=dtype)
-    dy = y[1]-y[0]
-    u = u.unsqueeze(2)
-    a = a.unsqueeze(2)
-    y = y[None,None,:]
-    try:
-        numerator = torch.exp(-y**2)
-        denominator = (u-y)**2+a**2
-        integrand = numerator/denominator
-        profile = (a[:,:,0]/torch.pi**1.5)*torch.trapz(integrand,dx=dy,dim=-1)
-    except:
-        print(u.shape,a.shape,y.shape)
-        raise
-    return profile
+__all__ = [
+    "MEForward",
+    "VoigtProfile",
+    "VoigtFaradayProfile",
+    "VoigtProfileQuadrature",
+    "VoigtFaradayProfileQuadrature",
+]
+
 
 class MEForward:
     kB      = 1.380649e-23    # J/K -> Boltzmann constant
