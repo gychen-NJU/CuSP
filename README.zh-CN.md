@@ -47,7 +47,7 @@ params = inv(iquv_obs, initial_guess='sdo_hmi')           # 用 PI2NN 给初猜
 | 功能 | 模块 | 说明 |
 |---|---|---|
 | ME 前向合成 Stokes `IQUV` | `me_forward.py` | Unno–Rachkovsky 解析解，全向量化、可微、与设备无关 |
-| ME 反演（批量模拟退火） | `me_inversion.py` + `annealing.py` | `method='gsa'`——带梯度偏置步长选择的广义模拟退火，即论文的 **GBA** 算法（推荐）；或 `'csa'`（共轭模拟退火）；支持 GPU |
+| ME 反演（四种方法可互换） | `me_inversion.py` | `method='annealing'`（带梯度偏置步长选择的广义模拟退火，即论文的 **GBA**，推荐）、`'lm'`（Levenberg–Marquardt）、`'cmaes'`（CMA-ES）或 `'csa'`（旧的共轭模拟退火）；支持 GPU |
 | 快速 Voigt / Faraday–Voigt 线型 | `voigt.py` | 用 Faddeeva 函数的 7/7 复有理逼近——不做数值积分，比原梯形积分快约 13 倍 |
 | 学习型初猜 | `initial_guess.py` | 内置 **SDO/HMI** Fe I 6173 Å 的 `PI2NN` 网络：`initial_guess='sdo_hmi'` |
 | 物理信息神经网络反演 | `PI2NN.py` | `InversionNet`（卷积 + 注意力 + 残差全连接）+ 物理损失，含训练循环 |
@@ -83,6 +83,9 @@ CuSP/
     ├── me_forward.py        # MEForward      ：Stokes IQUV 前向合成
     ├── me_inversion.py      # MEInversion    ：批量 ME 反演（含 CudaAnnealing）
     ├── annealing.py         # GSA / DualAnnealing 的构件
+    ├── lm.py                # BatchLM        ：批量 Levenberg-Marquardt
+    ├── cmaes.py             # BatchCMAES     ：批量 CMA-ES
+    ├── me_inverters.py      # 把 BatchLM / BatchCMAES 接到 ME 问题上
     ├── voigt.py             # 快速 Voigt 与 Faraday–Voigt 线型
     ├── initial_guess.py     # PI2NN 初猜（加载 / 注册 / 推理）
     ├── PI2NN.py             # 物理信息神经网络反演
@@ -154,24 +157,88 @@ iquv = torch.stack([I, Q, U, V], dim=1)                                        #
 
 ### 5.2 ME 反演
 
-下面的例子反演的是*采样后*的光谱（`lm`，7 点，接近仪器采样）；退火过程中会
-打印降温进度。
+四种优化器作用在**完全相同**的归一化参数盒 `[0,1]^8` 上，接受相同的
+`initial_guess`、最小化同一个加权 chi2，因此换一个关键字就能切换或对比：
+
+| `method=` | 优化器 | 特点 |
+|---|---|---|
+| `'annealing'`（别名 `'gsa'`） | 带梯度偏置步长选择的广义模拟退火（`DualAnnealing`），即论文的 **GBA** | 随机、无需梯度、对差初值较稳健 |
+| `'lm'` | Levenberg–Marquardt（`CuSP.lm.BatchLM`） | 局部方法，用解析 Jacobian（autograd）；**好初值下**收敛最快最准 |
+| `'cmaes'` | CMA-ES（`CuSP.cmaes.BatchCMAES`） | 无梯度的全局搜索；本问题上单位时间精度最好 |
+| `'csa'` | 共轭模拟退火（`CudaAnnealing`，旧） | 会打印完整 epoch 日志 |
 
 ```python
 from CuSP import MEInversion
 
 inv = MEInversion(torch.tensor(lm).float(), landeG=2.5, lambda0=630.25, wing=wing)
+x0 = inv.make_initial_guess(iquv_obs, initial_guess='random')   # 或 'sdo_hmi'，见第 6 节
 
 # (a) 随机初猜 + 广义/梯度偏置模拟退火（即论文的 GBA）
 params = inv(iquv_obs, maxiter=200, initial_temp=5230.)
 
-# (b) 共轭模拟退火（较老的方法）
+# (b) Levenberg-Marquardt（局部方法，要给好初值）
+params = inv(iquv_obs, method='lm', max_iter=60, initial_guess=x0)
+
+# (c) CMA-ES（无梯度全局搜索）
+params = inv(iquv_obs, method='cmaes', max_iter=200, initial_guess=x0)
+
+# (d) 旧的共轭模拟退火
 params = inv(iquv_obs, method='csa', max_iter=1000)
 
-# (c) 用 PI2NN 的预测作为退火起点 —— 内置网络绑定的是 SDO/HMI 的采样方式，
-#     需要单独构造反演对象：见第 6 节
-#     params = inv_hmi(iquv_obs_hmi, initial_guess='sdo_hmi', maxiter=100)
+# (e) 用 PI2NN 预测作初值 —— 内置网络绑定 SDO/HMI 采样，需要单独的反演对象：见第 6 节
+#     params = inv_hmi(iquv_obs_hmi, initial_guess='sdo_hmi', method='lm')
 ```
+
+该用哪个？在第 6 节那条合成的 SDO/HMI 光谱上实测（1 像素、6 波长、无噪声，
+三者从**同一个** PI2NN 初值出发；`chi2/dof` 就是 `merit_function` 的返回值）：
+
+| 方法 | `chi2/dof` 起点 → 终点 | 耗时 | 参数误差 |
+|---|---|---|---|
+| `annealing`（`maxiter=100`、`initial_temp=0.1`） | 6.9e-2 → 3.2e-3 | 18 s | 退化：拟合看着完美但 η₀ 偏 57% |
+| `lm`（`max_iter=60`） | 6.9e-2 → **3.7e-13** | 19 s | 精确 |
+| `cmaes`（`max_iter=200`） | 6.9e-2 → 9.1e-6 | **1.1 s** | 单参数 ≤ 9% |
+
+若用默认的 `initial_temp=5230`，退火在本问题上**完全没有改善初值**（6.9e-2 → 6.9e-2）：
+该温度比这里的 merit 量级（`chi2/dof ≈ 1e-2`）高约 5 个数量级，几乎任何试探都被接受。
+请把 `initial_temp` 调到你自己问题的 merit 量级。
+
+#### 推荐的使用流程
+
+* **有网络提供初猜**（例如 `initial_guess='sdo_hmi'`）→ 直接用 **`lm`**。
+  它是局部方法，只要初值够好就能精确收敛，是三者里最准的。
+* **没有网络（随机初猜）** → **先跑 `cmaes` 或 `annealing` 做全局搜索，再交给
+  `lm` 精修**。在这个多峰问题上，单独用 `lm` 从随机初值出发完全没有进展。
+
+```python
+import torch
+
+# —— 没有网络：先全局搜索，再用 LM 精修 ——
+p1 = inv(iquv_obs, method='annealing', maxiter=100, initial_temp=0.1)
+# p1 = inv(iquv_obs, method='cmaes', max_iter=200)      # 也可用它做全局段
+x1 = inv.normalizing_parameter(torch.as_tensor(p1))     # 换回归一化 [0,1]^8
+p2 = inv(iquv_obs, method='lm', max_iter=60, initial_guess=x1)
+
+# —— 有网络给初猜：直接用 LM ——
+#（内置网络绑定它自己的波长配置，需要用对应的反演对象，见第 6 节）
+p2 = inv_hmi(iquv_obs_hmi, method='lm', max_iter=60, initial_guess='sdo_hmi')
+```
+
+在第 6 节那条 HMI 光谱上实测（单像素、CPU，`chi2/dof`）：
+
+| 初猜 | 第一段 | 接 `lm` 之后 | 总耗时 |
+|---|---|---|---|
+| 随机 | 只用 `lm` | 2.12 → 2.12（**无进展**） | 22 s |
+| 随机 | `cmaes`，200 代 | 1.41e-1 → 1.41e-1 | 22 s |
+| 随机 | `annealing`，100 步（`initial_temp=0.1`） | 6.40e-2 → **2.2e-13** | 35 s |
+| PI2NN（`'sdo_hmi'`） | – | 6.90e-2 → **4.1e-13** | 18 s |
+
+由此有两点提醒：
+
+* 这里 `annealing → lm` 是可靠的两段式路线。若把 `lm` 接到 `cmaes` 的解上，它的
+  第一步牛顿步会跨出物理盒，落在外面的"精确解"又被盒投影reject掉，于是没有收益
+  ——而单独一次 `cmaes` 已经能在 1 秒多内给出很好的拟合。
+* `cmaes` 的单位时间性价比最高（从 PI2NN 初猜出发 1.1 s 就到 `chi2/dof = 9.1e-6`），
+  因此上百万像素时适合做第一遍，再对需要更高精度的地方补 `lm`。
 
 `iquv_obs` 形状为 `(B, 4, N)`（通道顺序 `I, Q, U, V`，连续谱归一化，即
 `MEForward` 的输出）。返回的 `params` 是物理量 `(B, 8)`；归一化的起点/终点与
@@ -187,7 +254,7 @@ inv.ivs_results.keys()   # dict_keys(['x0', 'e0', 'x', 'e'])
 
 | 关键字 | 默认值 | 含义 |
 |---|---|---|
-| `method` | `'gsa'` | `'gsa'` 或 `'csa'` |
+| `method` | `'annealing'` | `'annealing'`（= `'gsa'`）、`'lm'`、`'cmaes'` 或 `'csa'` |
 | `initial_guess` | `None` | 见第 6 节 |
 | `x_guess` | `None` | 显式的归一化 `(B,8)` 起点，优先于 `initial_guess` |
 | `maxiter` / `max_iter` | `1000` | 每个温度下的退火步数 |
@@ -360,6 +427,14 @@ visit, accept, no_local_search)`，以及 `GSA`、`VisitDistribution`、`EnergyS
 `AdamLocalSearch`、`BatchAdam`、`AnnealingResult`。
 **`me_inversion.CudaAnnealing`** —— `csa` 的驱动器。
 
+**`lm.py`** —— `BatchLM(max_iters, init_damping, damping_mode, step_solver, …)`：
+可微 `forward(x)` 上的批量 Levenberg–Marquardt，`__call__(Y, guess, sig=…) -> x_best`。
+**`cmaes.py`** —— `BatchCMAES(max_iters, pop_size, init_sigma, patience, …)`：
+批量 CMA-ES（对角/完整协方差），调用约定相同。
+**`me_inverters.py`** —— `MEObjective`（展平的加权 chi2 目标函数）、`run_lm`、
+`run_cmaes`：把两个优化器接到 ME 问题上的适配层（同一个归一化盒、与
+`merit_function` 相同的 `sig`）。
+
 **`initial_guess.py`** —— `load_pi2nn_model`、`PI2NNInitialGuess`
 （`predict_physical`、`predict_normalized`、`check_inversion`、`describe`）、
 `get_initial_guess_model`、`initial_guess_from_spectrum`、
@@ -384,6 +459,9 @@ visit, accept, no_local_search)`，以及 `GSA`、`VisitDistribution`、`EnergyS
   实例用 `.eval()`（见 5.4 节）。加载内置权重不会触发这一点，但你自己的代码可能。
 * **`method='csa'`** 曾因 `UnboundLocalError: E_init` 必崩，现已修复
   （`CudaAnnealing._annealing`）；仍推荐 `'gsa'`。
+* **merit 数值**：`ivs_results['e']` / `['e0']` 一律由返回的参数（`x` / `x0`）
+  重新计算，因为退火器内部的 `e_best` 可能和它返回的 `x_best` 不同步——在 HMI
+  测试谱上实测到 GSA 报出的能量比它实际返回参数的 merit 低约 70 倍。
 * **`initial_guess.py` 的加载**：内置 checkpoint 是脚本以*顶层*模块 `PI2NN`
   保存的，直接 `torch.load` 无法反序列化，`load_pi2nn_model` 会把那些类引用映射
   到 `CuSP.PI2NN`。`torch>=2.6` 还需要 `weights_only=False`，加载器在支持时会自动传。

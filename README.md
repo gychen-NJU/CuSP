@@ -49,7 +49,7 @@ params = inv(iquv_obs, initial_guess='sdo_hmi')           # PI2NN initial guess
 | Feature | Module | Notes |
 |---|---|---|
 | ME forward synthesis of Stokes `IQUV` | `me_forward.py` | analytic Unno–Rachkovsky solution, fully vectorised, differentiable, device-agnostic |
-| ME inversion (batched simulated annealing) | `me_inversion.py` + `annealing.py` | `method='gsa'` — generalized simulated annealing with a gradient-biased step selection, i.e. the **GBA** algorithm of the paper (recommended) — or `'csa'` (conjugate SA); GPU-supported |
+| ME inversion (batched, four interchangeable methods) | `me_inversion.py` | `method='annealing'` (generalized SA with a gradient-biased step selection, i.e. the **GBA** algorithm of the paper; recommended), `'lm'` (Levenberg–Marquardt), `'cmaes'` (CMA-ES) or `'csa'` (legacy conjugate SA); GPU-supported |
 | Fast Voigt / Faraday–Voigt profiles | `voigt.py` | 7/7 complex rational approximation of the Faddeeva function — no numerical quadrature, ~13× faster than the original trapezoidal implementation |
 | Learned initial guesses | `initial_guess.py` | shipped `PI2NN` network for **SDO/HMI** Fe I 6173 Å spectra: `initial_guess='sdo_hmi'` |
 | Physics-informed neural network inversion | `PI2NN.py` | `InversionNet` (conv + attention + residual FC) with a physics loss, plus a training loop |
@@ -85,6 +85,9 @@ CuSP/
     ├── me_forward.py        # MEForward      : Stokes IQUV forward synthesis
     ├── me_inversion.py      # MEInversion    : batched ME inversion (+ CudaAnnealing)
     ├── annealing.py         # GSA / DualAnnealing building blocks
+    ├── lm.py                # BatchLM        : batched Levenberg-Marquardt
+    ├── cmaes.py             # BatchCMAES     : batched CMA-ES
+    ├── me_inverters.py      # binds BatchLM / BatchCMAES to the ME problem
     ├── voigt.py             # fast Voigt & Faraday–Voigt profiles
     ├── initial_guess.py     # PI2NN initial guesses (load / register / evaluate)
     ├── PI2NN.py             # physics-informed neural network inversion
@@ -158,24 +161,98 @@ returns a single `(4, B, N)` tensor that unpacks into `I, Q, U, V`.
 
 ### 5.2 ME inversion
 
-The example below inverts a *sampled* spectrum (`lm`, a 7-point instrument-like
-sampling); the annealing prints its progress as it cools.
+Four interchangeable optimizers work on exactly the same normalised parameter
+box `[0, 1]^8`, accept the same `initial_guess` and minimise the same weighted
+chi2, so they can be compared or swapped with one keyword:
+
+| `method=` | Optimizer | Character |
+|---|---|---|
+| `'annealing'` (alias `'gsa'`) | generalized simulated annealing with a gradient-biased step selection (`DualAnnealing`) — the paper's **GBA** | stochastic, derivative-free, robust to a poor start |
+| `'lm'` | Levenberg–Marquardt (`CuSP.lm.BatchLM`) | local, uses the analytic Jacobian (autograd); fastest convergence *from a good start*, needs one |
+| `'cmaes'` | CMA-ES (`CuSP.cmaes.BatchCMAES`) | derivative-free global search; no Jacobian, excellent accuracy per unit time here |
+| `'csa'` | conjugate simulated annealing (`CudaAnnealing`, legacy) | prints a full epoch log |
 
 ```python
 from CuSP import MEInversion
 
 inv = MEInversion(torch.tensor(lm).float(), landeG=2.5, lambda0=630.25, wing=wing)
+x0 = inv.make_initial_guess(iquv_obs, initial_guess='random')   # or 'sdo_hmi', see section 6
 
 # (a) generalized / gradient-bias annealing from a random start (the paper's GBA)
 params = inv(iquv_obs, maxiter=200, initial_temp=5230.)
 
-# (b) conjugate simulated annealing (older method)
+# (b) Levenberg-Marquardt (local: give it a good starting point)
+params = inv(iquv_obs, method='lm', max_iter=60, initial_guess=x0)
+
+# (c) CMA-ES (derivative-free global search)
+params = inv(iquv_obs, method='cmaes', max_iter=200, initial_guess=x0)
+
+# (d) legacy conjugate simulated annealing
 params = inv(iquv_obs, method='csa', max_iter=1000)
 
-# (c) start from a PI2NN prediction -- the shipped network is tied to the SDO/HMI
+# (e) start from a PI2NN prediction -- the shipped network is tied to the SDO/HMI
 #     sampling, so it needs its own inversion object: see section 6.
-#     params = inv_hmi(iquv_obs_hmi, initial_guess='sdo_hmi', maxiter=100)
+#     params = inv_hmi(iquv_obs_hmi, initial_guess='sdo_hmi', method='lm')
 ```
+
+Which one to use? Measured on the synthetic SDO/HMI spectrum of section 6
+(1 pixel, 6 wavelengths, noise-free, all three started from the *same* PI2NN
+guess; `chi2/dof` is the quantity `merit_function` returns):
+
+| method | `chi2/dof` start → end | wall time | parameter error |
+|---|---|---|---|
+| `annealing` (`maxiter=100`, `initial_temp=0.1`) | 6.9e-2 → 3.2e-3 | 18 s | degenerate: η₀ off by 57 % while the fit looks perfect |
+| `lm` (`max_iter=60`) | 6.9e-2 → **3.7e-13** | 19 s | exact |
+| `cmaes` (`max_iter=200`) | 6.9e-2 → 9.1e-6 | **1.1 s** | ≤ 9 % per parameter |
+
+With the *default* `initial_temp=5230` the annealer does not improve on the
+starting guess at all here (6.9e-2 → 6.9e-2): that temperature is ~5 orders of
+magnitude above this problem's merit scale (`chi2/dof ≈ 1e-2`), so nearly every
+proposal is accepted.  Tune `initial_temp` to the merit scale of your problem.
+
+#### Recommended workflow
+
+* **With a trained network** for your line/instrument (e.g.
+  `initial_guess='sdo_hmi'`) → use **`lm`**.  It is a local method, so a good
+  starting point is all it needs: it converges to the exact solution and is the
+  most accurate of the three.
+* **Without a network** (random initial guess) → run **`cmaes` or `annealing`
+  first** for the global search, **then `lm`** to refine.  LM alone makes no
+  progress from a random start on this multi-modal problem.
+
+```python
+import torch
+
+# --- no network available: global search first, then LM refinement ----------
+p1 = inv(iquv_obs, method='annealing', maxiter=100, initial_temp=0.1)
+# p1 = inv(iquv_obs, method='cmaes', max_iter=200)      # alternative global stage
+x1 = inv.normalizing_parameter(torch.as_tensor(p1))     # back to the [0, 1]^8 box
+p2 = inv(iquv_obs, method='lm', max_iter=60, initial_guess=x1)
+
+# --- a network provides the starting point: LM straight away ----------------
+# (the shipped network is tied to its own wavelength setup -- see section 6)
+p2 = inv_hmi(iquv_obs_hmi, method='lm', max_iter=60, initial_guess='sdo_hmi')
+```
+
+Measured on the HMI spectrum of section 6 (one pixel, CPU, `chi2/dof`):
+
+| starting point | first stage | after `lm` | total time |
+|---|---|---|---|
+| random | `lm` alone | 2.12 → 2.12 (**no progress**) | 22 s |
+| random | `cmaes`, 200 generations | 1.41e-1 → 1.41e-1 | 22 s |
+| random | `annealing`, 100 steps (`initial_temp=0.1`) | 6.40e-2 → **2.2e-13** | 35 s |
+| PI2NN (`'sdo_hmi'`) | – | 6.90e-2 → **4.1e-13** | 18 s |
+
+Two remarks from that table:
+
+* `annealing → lm` is the reliable two-stage route here.  When `lm` is started
+  from the `cmaes` solution instead, its first Newton step leaves the physical
+  box and the mathematically exact fit it finds there is rejected by the box
+  projection, so nothing is gained — a plain `cmaes` run on its own already gives
+  a very good fit within seconds.
+* `cmaes` is by far the cheapest good solution per unit time (1.1 s for
+  `chi2/dof = 9.1e-6` from the PI2NN start), so for millions of pixels it is the
+  natural first pass, with `lm` added only where the extra accuracy is needed.
 
 `iquv_obs` has shape `(B, 4, N)` (channels ordered `I, Q, U, V`, continuum
 normalised, i.e. exactly what `MEForward` returns).  The returned `params` is the
@@ -192,7 +269,7 @@ Useful keyword arguments (pass through `inv(...)`):
 
 | Keyword | Default | Meaning |
 |---|---|---|
-| `method` | `'gsa'` | `'gsa'` or `'csa'` |
+| `method` | `'annealing'` | `'annealing'` (= `'gsa'`), `'lm'`, `'cmaes'` or `'csa'` |
 | `initial_guess` | `None` | see section 6 |
 | `x_guess` | `None` | explicit normalised `(B,8)` start; takes precedence over `initial_guess` |
 | `maxiter` / `max_iter` | `1000` | annealing iterations per temperature |
@@ -377,6 +454,15 @@ visit, accept, no_local_search)`, plus `GSA`, `VisitDistribution`, `EnergyState`
 `AdamLocalSearch`, `BatchAdam`, `AnnealingResult`.
 **`me_inversion.CudaAnnealing`** — the `csa` driver.
 
+**`lm.py`** — `BatchLM(max_iters, init_damping, damping_mode, step_solver, …)`:
+batched Levenberg–Marquardt over a differentiable `forward(x)`, `__call__(Y, guess,
+sig=…) -> x_best`.
+**`cmaes.py`** — `BatchCMAES(max_iters, pop_size, init_sigma, patience, …)`:
+batched CMA-ES (separable/full covariance) with the same calling convention.
+**`me_inverters.py`** — `MEObjective` (flattened weighted-chi2 objective),
+`run_lm`, `run_cmaes`: the adapters that bind both optimizers to the ME problem
+(same normalised box and the same `sig` as `merit_function`).
+
 **`initial_guess.py`** — `load_pi2nn_model`, `PI2NNInitialGuess`
 (`predict_physical`, `predict_normalized`, `check_inversion`, `describe`),
 `get_initial_guess_model`, `initial_guess_from_spectrum`,
@@ -404,6 +490,11 @@ visit, accept, no_local_search)`, plus `GSA`, `VisitDistribution`, `EnergyState`
   checkpoint does not hit this, but your own code might.
 * **`method='csa'`** used to crash with `UnboundLocalError: E_init`; this is
   fixed (`CudaAnnealing._annealing`).  `'gsa'` remains the recommended method.
+* **Merit values.** `ivs_results['e']` / `['e0']` are always re-evaluated from
+  the returned parameters (`x` / `x0`), because the annealers' internal
+  `e_best` can drift out of sync with the `x_best` they return — measured on the
+  HMI test spectrum, the GSA reported an energy ≈70× lower than the merit of the
+  parameters it actually returned.
 * **`initial_guess.py` loading.** The shipped checkpoint was saved from a script
   that imported `PI2NN` as a *top-level* module, so `torch.load` alone cannot
   unpickle it; `load_pi2nn_model` remaps those class references to

@@ -5,6 +5,11 @@ import matplotlib.pyplot as plt
 from .me_forward import MEForward
 from .annealing import DualAnnealing
 from .initial_guess import initial_guess_from_spectrum, PI2NNInitialGuess
+from .me_inverters import MEObjective, run_lm, run_cmaes
+
+
+#: inversion methods accepted by ``MEInversion.__call__``
+INVERSION_METHODS = ('annealing', 'gsa', 'csa', 'lm', 'cmaes')
 
 
 class MEInversion(MEForward):
@@ -17,12 +22,16 @@ class MEInversion(MEForward):
     Bmag_range = [5.,5000.]
     theta_range = [0.,np.pi]
     phi_range = [0.,np.pi]
+    # observation weights used by merit_function and by the LM / CMA-ES objective
+    merit_weights = [1.,5.,5.,3.5]
+    merit_sigmas  = [0.118,0.204,0.204,0.204]
     def __init__(self,wavebands,landeG=2.5,lambda0=630.25,wing=None):
         super().__init__(wavebands,landeG,lambda0,wing=wing)
         self.evaluator = None
         self.optimizer = None
         self.ivs_method = None
         self.ivs_results = None
+        self.ivs_log = None
         self.obsevation = dict()
 
     def synthesize(self,params_tensor:torch.Tensor):
@@ -34,12 +43,28 @@ class MEInversion(MEForward):
         device = kwargs.get('device',iquv_obs[0].device)
         iquv_obs = iquv_obs.to(device)
         iquv_syn = iquv_syn.to(device)
-        wights = torch.tensor([1,5,5,3.5],device=device,dtype=iquv_obs[0].dtype)
-        sigmas = torch.tensor([0.118]+[0.204]*3,device=device,dtype=iquv_obs[0].dtype)
+        wights = torch.tensor(self.merit_weights,device=device,dtype=iquv_obs[0].dtype)
+        sigmas = torch.tensor(self.merit_sigmas,device=device,dtype=iquv_obs[0].dtype)
         F = iquv_obs.size(1)*iquv_obs.size(2)-8
         chi2   = torch.sum((iquv_obs-iquv_syn)**2/sigmas[None,:,None]**2*wights[None,:,None]**2,dim=(-1,-2)).unsqueeze(1)
         # print(f"chi2 device: {chi2.device} | iquv_obs device: {iquv_obs.device} | iquv_syn device: {iquv_syn.device}")
         return chi2/F
+
+    def measurement_variance(self,n_lambda:int):
+        '''
+        Per-element variance `sigma^2 / weight^2` that reproduces `merit_function`'s
+        weighted chi2 when the LM / CMA-ES optimizers are given it as their `sig`.
+
+        Returns a (1, 4*n_lambda) tensor in the flattened channel order I,Q,U,V.
+        '''
+        w = torch.tensor(self.merit_weights,dtype=torch.float64)
+        s = torch.tensor(self.merit_sigmas,dtype=torch.float64)
+        var = (s/w)**2                                   # (4,)
+        return var[:,None].expand(4,n_lambda).reshape(1,-1)
+
+    def make_objective(self,iquv_obs:torch.Tensor,clamp=(-1.,2.)):
+        '''Build the flattened weighted-chi2 objective used by LM / CMA-ES.'''
+        return MEObjective(self,iquv_obs,clamp=clamp)
 
     def gradient(self, y, x):
         gradients = torch.autograd.grad(
@@ -129,6 +154,15 @@ class MEInversion(MEForward):
             plt.xscale('log')
             plt.gca().invert_xaxis()
             plt.title('Annealing History')
+        elif self.ivs_method in ('lm','cmaes'):
+            hist = (self.ivs_results or dict()).get('chi2_history',[])
+            if not hist:
+                raise RuntimeError('No convergence history recorded for this inversion')
+            plt.plot(hist)
+            plt.xlabel('iteration')
+            plt.ylabel('chi2')
+            plt.yscale('log')
+            plt.title(f'{self.ivs_method.upper()} Convergence History')
         else:
             raise RuntimeError(f"Could not plot before inversion done")
         
@@ -161,6 +195,9 @@ class MEInversion(MEForward):
         elif self.ivs_method == 'gsa':
             params_ivs = torch.from_numpy(self.ivs_results['x'][choice:choice+1]).cpu()
             # print(params_ivs)
+            iquv_ivs = torch.stack(list(forward_cont(*params_ivs.T[:,:,None])),dim=1)
+        elif self.ivs_method in ('lm','cmaes'):
+            params_ivs = torch.from_numpy(self.ivs_results['x'][choice:choice+1]).cpu()
             iquv_ivs = torch.stack(list(forward_cont(*params_ivs.T[:,:,None])),dim=1)
         else:
             raise ValueError(f'Could not plot before inversion done')
@@ -268,24 +305,43 @@ class MEInversion(MEForward):
             iquv_obs: torch.Tensor, observed IQUV with shape (B,4,N)
         ====
         Parameters:
-            method: str, optimization method, default: 'gsa', ['gsa','csa']
+            method: str, optimization method, default: 'gsa', one of
+                'annealing' (= 'gsa'), 'gsa', 'csa', 'lm', 'cmaes'
+                'annealing'/'gsa' : generalized simulated annealing (`DualAnnealing`)
+                'csa'             : conjugate simulated annealing (`CudaAnnealing`)
+                'lm'              : batched Levenberg-Marquardt (`CuSP.lm.BatchLM`)
+                'cmaes'           : batched CMA-ES (`CuSP.cmaes.BatchCMAES`)
+                All four minimize the same weighted chi2 over the same normalised
+                parameter box [0, 1]^8 and accept the same `initial_guess`.
             device: torch.device, device, default: iquv_obs.device
             initial_guess: None | str | torch.Tensor | callable, default: None
-                Starting point of the annealing.  None keeps the original
-                uniform-random guess; 'sdo_hmi' evaluates the shipped PI2NN
-                network on `iquv_obs` and uses its prediction (see
-                `CuSP.initial_guess`); a tensor is taken as normalised
+                Starting point of the inversion.  None gives a uniform random guess;
+                'sdo_hmi' evaluates the shipped PI2NN network on `iquv_obs`
+                (see `CuSP.initial_guess`); a tensor is taken as normalised
                 parameters; a callable is called as
                 `f(iquv_obs, inversion=self, device=device)`.
                 `x_guess=` (normalised tensor) is still accepted and takes
                 precedence over `initial_guess`.
-            Other parameters see `CudaAnnealing` if 'csa' or `DualAnnealing` if 'gsa'
+            maxiter / max_iter: int, iterations for 'lm' (default 60) and 'cmaes'
+                (default 200); for the annealing methods it is the number of
+                steps per temperature (default 1000)
+            isPrint: bool, print optimizer progress (default False for 'cmaes',
+                True for 'lm')
+            Other parameters see `CudaAnnealing` / `DualAnnealing` (annealing),
+            `CuSP.lm.BatchLM` (lm) or `CuSP.cmaes.BatchCMAES` (cmaes)
         ====
         Output:
             params_ivs: torch.Tensor, inverted parameters
         '''
         self.obsevation['iquv_obs'] = iquv_obs
         method = kwargs.pop('method', 'gsa')
+        if not isinstance(method, str) or method.lower() not in INVERSION_METHODS:
+            raise ValueError(
+                f'Invalid method: {method!r}, support: {", ".join(INVERSION_METHODS)}')
+        method = method.lower()
+        # 'annealing' is the recommended generalized-simulated-annealing driver
+        if method == 'annealing':
+            method = 'gsa'
         device = kwargs.get('device',iquv_obs.device)
         self.wavebands = self.wavebands.to(device)
         self.ivs_method = method
@@ -297,6 +353,46 @@ class MEInversion(MEForward):
         else:
             kwargs.pop('initial_guess', None)
         x_guess = self.make_initial_guess(iquv_obs, guess_spec, device=device)
+        if method in ('lm','cmaes'):
+            # ---- Levenberg-Marquardt / CMA-ES on the same normalised box ----
+            obs = iquv_obs.to(device)
+            objective = self.make_objective(obs, clamp=kwargs.pop('objective_clamp',(-1.,2.)))
+            x_guess = x_guess.detach().clone().to(device=device,dtype=objective.dtype)
+            is_print = kwargs.pop('isPrint', method == 'lm')
+            maxiter = kwargs.pop('max_iter', kwargs.pop('maxiter', 60 if method=='lm' else 200))
+            if method == 'lm':
+                options = {k: kwargs.pop(k) for k in
+                           ('init_damping','damping_mode','damping_adapt','step_solver',
+                            'adaptive_init_damping','patience','tol_grad','tol_step','tol_loss',
+                            'max_line_search','trust_region','config') if k in kwargs}
+                x_best,optimizer = run_lm(objective,x_guess,max_iters=maxiter,
+                                          isPrint=is_print,**options)
+            else:
+                options = {k: kwargs.pop(k) for k in
+                           ('init_sigma','patience','pop_size','bounded','covariance_mode',
+                            'config') if k in kwargs}
+                x_best,optimizer = run_cmaes(objective,x_guess,max_iters=maxiter,
+                                             isPrint=is_print,**options)
+            x_best = x_best.detach().clamp(0.,1.)
+            # LM may explore slightly outside the physical box (the objective
+            # tolerates a margin); after projecting back, keep whichever of the
+            # projected solution and the initial guess is better.
+            with torch.no_grad():
+                keep = objective.merit(x_best) < objective.merit(x_guess)
+                x_best = torch.where(keep[:,None],x_best,x_guess)
+            self.optimizer = optimizer
+            self.ivs_log = dict(getattr(optimizer,'log',{}))
+            params_ivs = self.denormalizing_parameter(x_best)
+            e0 = np.asarray(objective.merit(x_guess).detach().cpu()).reshape(-1,1)
+            e  = np.asarray(objective.merit(x_best).detach().cpu()).reshape(-1,1)
+            self.ivs_results = dict(
+                x0=self.denormalizing_parameter(x_guess).detach().cpu().numpy(),
+                e0=e0,
+                x=params_ivs.detach().cpu().numpy(),
+                e=e,
+                chi2_history=[h/objective.dof for h in self.ivs_log.get('chi2_history',[])],
+            )
+            return params_ivs
         if method == 'csa':
             kwargs.pop('method', None)
             iquv_obs = iquv_obs.to(device)
@@ -362,8 +458,48 @@ class MEInversion(MEForward):
                     self.ivs_results['e'][i*max_batches:(i+1)*max_batches] = res.e.detach().cpu().numpy()
                 params_ivs = torch.cat(params_ivs,dim=0)
         else:
-            raise ValueError(f'Invalid method: {method}, support: csa, gsa')
+            raise ValueError(
+                f'Invalid method: {method!r}, support: {", ".join(INVERSION_METHODS)}')
+        if isinstance(self.ivs_results,dict) and 'chi2_history' not in self.ivs_results:
+            self.ivs_results['chi2_history'] = self._inversion_history()
+        if isinstance(self.ivs_results,dict):
+            self._refresh_reported_merit(iquv_obs.to(device))
         return params_ivs
+
+    def _refresh_reported_merit(self,iquv_obs:torch.Tensor):
+        '''
+        Re-evaluate `e0`/`e` from the stored parameters `x0`/`x`.
+
+        The annealers report `energy_state.e_best`, which can drift out of sync
+        with the returned `x_best` (measured on the HMI test spectrum: the GSA's
+        reported energy was ~70x lower than the merit of the parameters it
+        actually returned), so `ivs_results['e']` is always recomputed here. That
+        keeps the merit consistent with `ivs_results['x']` for every method.
+        '''
+        with torch.no_grad():
+            for key_x,key_e in (('x0','e0'),('x','e')):
+                x = self.ivs_results.get(key_x,None)
+                if x is None:
+                    continue
+                x = torch.as_tensor(np.asarray(x),device=iquv_obs.device,dtype=iquv_obs.dtype)
+                # x0 / x are already physical parameters (they were produced by
+                # denormalizing_parameter), so synthesise them directly
+                syn = self.synthesize(x)
+                self.ivs_results[key_e] = self.merit_function(iquv_obs,syn).detach().cpu().numpy()
+
+    def _inversion_history(self):
+        '''
+        Merit (chi2/dof) history of the last inversion, when the method records one.
+
+        All methods store it under `ivs_results['chi2_history']` so that the
+        convergence of annealing / LM / CMA-ES can be compared on one scale.
+        '''
+        if self.ivs_method == 'gsa' and getattr(self,'results',None) is not None:
+            history = getattr(self.results,'history',None) or dict()
+            return list(history.get('emin_history',[]))
+        if self.ivs_method == 'csa' and self.optimizer is not None:
+            return list(getattr(self.optimizer,'results',dict()).get('Emin_list',[]))
+        return []
 
 class CudaAnnealing:
     def __init__(self,func,x0:torch.Tensor,**kwargs):

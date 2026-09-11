@@ -17,6 +17,9 @@ from .initial_guess import (
     load_pi2nn_model,
     register_initial_guess,
 )
+from .me_inverters import MEObjective, run_cmaes, run_lm
+from .lm import BatchLM
+from .cmaes import BatchCMAES
 
 __all__ = [
     'MEForward',
@@ -27,4 +30,9 @@ __all__ = [
     'list_initial_guess_models',
     'load_pi2nn_model',
     'register_initial_guess',
+    'MEObjective',
+    'run_lm',
+    'run_cmaes',
+    'BatchLM',
+    'BatchCMAES',
 ]
