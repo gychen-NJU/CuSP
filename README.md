@@ -8,14 +8,14 @@
 > **A&A 710, A227 (2026)** — DOI
 > [10.1051/0004-6361/202659270](https://doi.org/10.1051/0004-6361/202659270)
 > (open access, CC BY 4.0).  Please cite it if you use this code; a ready-to-paste
-> BibTeX entry is in [section 11](#11-citation).
+> BibTeX entry is in [section 10](#10-citation).
 
 `CuSP` is a PyTorch toolkit for the **Milne–Eddington (ME) inversion of solar
 spectropolarimetric data**.  It provides a fully differentiable forward model of
-the Stokes vector `IQUV`, batched simulated-annealing inversion on GPU/CPU, fast
-Voigt line profiles, and a physics-informed neural network (`PI2NN`) that can be
-used to hand the inversion a good initial guess instead of starting from random
-noise.
+the Stokes vector `IQUV`, batched inversion on GPU/CPU (CMA-ES, generalized
+simulated annealing, Levenberg–Marquardt), fast Voigt line profiles, and a
+physics-informed neural network (`PI2NN`) that can be used to hand the inversion
+a good initial guess instead of starting from random noise.
 
 ```python
 import torch
@@ -39,8 +39,7 @@ params = inv(iquv_obs, initial_guess='sdo_hmi')           # PI2NN initial guess
 7. [Line profiles](#7-line-profiles)
 8. [Module reference](#8-module-reference)
 9. [Notes, caveats and known issues](#9-notes-caveats-and-known-issues)
-10. [Reproducing the validation](#10-reproducing-the-validation)
-11. [Citation](#11-citation)
+10. [Citation](#10-citation)
 
 ---
 
@@ -50,7 +49,7 @@ params = inv(iquv_obs, initial_guess='sdo_hmi')           # PI2NN initial guess
 |---|---|---|
 | ME forward synthesis of Stokes `IQUV` | `me_forward.py` | analytic Unno–Rachkovsky solution, fully vectorised, differentiable, device-agnostic |
 | ME inversion (batched, four interchangeable methods) | `me_inversion.py` | `method='cmaes'` (CMA-ES, **default**), `'annealing'` (generalized SA with a gradient-biased step selection, i.e. the **GBA** algorithm of the paper), `'lm'` (Levenberg–Marquardt) or `'csa'` (legacy conjugate SA); GPU-supported |
-| Fast Voigt / Faraday–Voigt profiles | `voigt.py` | 7/7 complex rational approximation of the Faddeeva function — no numerical quadrature, ~13× faster than the original trapezoidal implementation |
+| Fast Voigt / Faraday–Voigt profiles | `voigt.py` | 7/7 complex rational approximation of the Faddeeva function — no numerical quadrature, accurate for small and large damping alike |
 | Vectorised response functions (Jacobians) | `me_rf.py` | element-wise (pixel × wavelength) autodiff: the response functions of all four Stokes components in one backward pass each, so the LM Jacobian no longer scales with the number of wavelength samples |
 | Learned initial guesses | `initial_guess.py` | shipped `PI2NN` network for **SDO/HMI** Fe I 6173 Å spectra: `initial_guess='sdo_hmi'` |
 | Physics-informed neural network inversion | `PI2NN.py` | `InversionNet` (conv + attention + residual FC) with a physics loss, plus a training loop |
@@ -171,7 +170,7 @@ chi2, so they can be compared or swapped with one keyword:
 
 | `method=` | Optimizer | Character |
 |---|---|---|
-| `'cmaes'` | CMA-ES (`CuSP.cmaes.BatchCMAES`) | derivative-free global search; no Jacobian, excellent accuracy per unit time here — **the default**, because it is the only method that makes real progress from the default random start |
+| `'cmaes'` | CMA-ES (`CuSP.cmaes.BatchCMAES`) | derivative-free global search, no Jacobian needed — **the default method** |
 | `'annealing'` (alias `'gsa'`) | generalized simulated annealing with a gradient-biased step selection (`DualAnnealing`) — the paper's **GBA** | stochastic, derivative-free, robust to a poor start |
 | `'lm'` | Levenberg–Marquardt (`CuSP.lm.BatchLM`) | local, uses the exact Jacobian obtained by autodiff from the vectorised response functions (`me_rf.py`, one backward pass per Stokes component); fastest convergence *from a good start*, needs one |
 | `'csa'` | conjugate simulated annealing (`CudaAnnealing`, legacy) | prints a full epoch log |
@@ -199,31 +198,33 @@ params = inv(iquv_obs, method='csa', max_iter=1000)
 #     params = inv_hmi(iquv_obs_hmi, initial_guess='sdo_hmi', method='lm')
 ```
 
-Which one to use? Measured on the synthetic SDO/HMI spectrum of section 6
-(1 pixel, 6 wavelengths, noise-free, all three started from the *same* PI2NN
-guess; `chi2/dof` is the quantity `merit_function` returns):
+Which one to use?
 
-| method | `chi2/dof` start → end | wall time | parameter error |
-|---|---|---|---|
-| `annealing` (`maxiter=100`, `initial_temp=0.1`) | 6.9e-2 → 3.2e-3 | 3.5 s | degenerate: η₀ off by 57 % while the fit looks perfect |
-| `lm` (`max_iter=60`) | 6.9e-2 → **1.8e-13** | 2.1 s | exact |
-| `cmaes` (`max_iter=200`) | 6.9e-2 → 4.9e-7 | **0.3 s** | 0.23 % (median over the 8 parameters) |
+* `cmaes` (the default) is the derivative-free global search: no Jacobian is
+  needed and it is cheap per unit accuracy, so it is the natural first pass over
+  large data sets;
+* `annealing` is the paper's GBA driver — stochastic, derivative-free and robust
+  to a poor start — but it needs `initial_temp` tuned to your merit scale;
+* `lm` is local and by far the most accurate once a good starting point exists,
+  and the vectorised response functions (below) make each of its iterations
+  cheap;
+* `csa` is kept for backwards compatibility.
 
-With the *default* `initial_temp=5230` the annealer does not improve on the
-starting guess at all here (6.9e-2 → 6.9e-2): that temperature is ~5 orders of
-magnitude above this problem's merit scale (`chi2/dof ≈ 1e-2`), so nearly every
-proposal is accepted.  Tune `initial_temp` to the merit scale of your problem.
+⚠️ `initial_temp` must be matched to the merit scale of your problem (the
+`chi2/dof` returned by `merit_function`).  If it sits far above the values a fit
+reaches, nearly every proposal is accepted and the annealer barely moves, so set
+it to the order of magnitude of your `chi2/dof`.
 
 #### Recommended workflow
 
 * **With a trained network** for your line/instrument (e.g.
-  `initial_guess='sdo_hmi'`) → use **`lm`**.  It is a local method, so a good
-  starting point is all it needs: it converges to the exact solution and is the
-  most accurate of the three.
+  `initial_guess='sdo_hmi'`) → use **`lm`**.  It is a local method, so a starting
+  point in the right basin is all it needs, and it is the most accurate of the
+  four.
 * **Without a network** (random initial guess) → run **`cmaes` or `annealing`
-  first** for the global search, **then `lm`** to refine.  LM alone makes no
-  progress from a random start on this multi-modal problem.  `cmaes` is the
-  default, so a plain `inv(iquv_obs)` already is that global stage.
+  first** for the global search, **then `lm`** to refine: `lm` alone has no way
+  of finding the basin from a random start on this multi-modal problem.  `cmaes`
+  is the default, so a plain `inv(iquv_obs)` already is that global stage.
 
 ```python
 import torch
@@ -243,27 +244,15 @@ Complete runnable versions of both recipes are in
 `src/CuSP/examples/inversion_random_cmaes_lm.py` and
 `src/CuSP/examples/inversion_pi2nn_lm.py`.
 
-Measured on the HMI spectrum of section 6 (one pixel, CPU, `chi2/dof`):
+A `cmaes`/`annealing` pass followed by `lm` is therefore the recommended route
+whenever no network is available: the global stage is what puts the local
+refinement into the right basin.  Two notes:
 
-| starting point | first stage | after `lm` | total time |
-|---|---|---|---|
-| random | `lm` alone | 2.12 → 2.12 (**no progress**) | 2.0 s |
-| random | `cmaes`, 200 generations | 1.40e-1 → **2.18e-13** | 1.9 s |
-| random | `annealing`, 100 steps (`initial_temp=0.1`) | 6.40e-2 → **3.16e-13** | 6.5 s |
-| PI2NN (`'sdo_hmi'`) | – | 6.90e-2 → **1.81e-13** | 2.1 s |
-
-So both global stages put `lm` in the basin of the true solution; `cmaes` → `lm`
-is even cheaper than `lm` alone, while `annealing` → `lm` costs a few times more
-but is the more robust of the two global stages.  Two notes:
-
-* the global stage must be allowed to explore: the CMA-ES class default
-  (population 10) stalls at `chi2/dof ≈ 0.13` from a random start, which `lm`
-  then cannot improve.  `CuSP.me_inverters.run_cmaes` therefore defaults to
-  `pop_size=30, bounded=False`, which is tuned for this problem (from the PI2NN
-  start it is ~20× more accurate as well);
-* `cmaes` is the cheapest good solution per unit time (0.3 s for
-  `chi2/dof = 4.9e-7` from the PI2NN start), so for millions of pixels it is the
-  natural first pass, with `lm` added only where the extra accuracy is needed.
+* the global stage must be allowed to explore, so `CuSP.me_inverters.run_cmaes`
+  defaults to `pop_size=30, bounded=False` (a larger population, no logit
+  squashing) instead of the class defaults;
+* `cmaes` is cheap per unit accuracy, so for millions of pixels it is the natural
+  first pass, with `lm` added only where the extra accuracy is needed.
 
 #### Response functions (Jacobians)
 
@@ -284,28 +273,15 @@ rf(x0, layout='lm')                    # (B, 4*N, 8)  = the Jacobian BatchLM wan
 
 `run_lm` installs it as the default through BatchLM's `usrLMcoef` hook (so
 `lm.py` itself is untouched); `rf_method='loop'` restores the previous
-loop-over-observables Jacobian.  Cost of one LM coefficient evaluation (Jacobian
-+ chi2 + gradient + Gauss–Newton matrix, one pixel, CPU, same HMI setup):
+loop-over-observables Jacobian.
 
-| sampling | loop over observables | vectorised response function | speed-up |
-|---|---|---|---|
-| HMI, 6 wavelengths (24 observables) | 90 ms | 17 ms | 5.3× |
-| 50 wavelengths (200 observables) | 0.54 s | 15 ms | 36× |
-| 200 wavelengths (800 observables) | 2.1 s | 14 ms | 148× |
-
-The numbers behind the speed-up are machine independent: the loop method spends
-`4N + 1` backward passes per evaluation, the vectorised one 5 (one per Stokes
-component plus the continuum normalisation), for any `N`.  The same ratio holds on
-a GPU (~5× at `N = 6` and batch sizes 1 … 512), where single-pixel work is still
-launch-bound — use it for batches.  The absolute CPU times above are single-pixel
-measurements and drift with the machine load; the ratios and the pass counts do
-not.
-
-A full `lm` run (60 iterations, one pixel, HMI sampling, PI2NN start) drops from
-4.9 s to 1.5 s for the same answer (`chi2/dof ≈ 2e-13`).  The response functions
-agree with the loop implementation to `2.3e-6` relative (float32) and with
-central finite differences to `2.4e-10` relative (float64) — see `check_me_rf.py`
-in section 10.
+The gain is structural rather than incremental: the loop method spends `4N + 1`
+backward passes per LM coefficient evaluation (one per observable, plus the loss
+gradient), while the vectorised version always spends **5** — one per Stokes
+component plus one for the continuum normalisation — whatever the number of
+wavelength samples `N`.  Dense sampling therefore costs no more than the HMI
+6-point setup.  (Single-pixel work on a GPU stays launch-bound, so use a GPU for
+batches rather than for one pixel at a time.)
 
 `iquv_obs` has shape `(B, 4, N)` (channels ordered `I, Q, U, V`, continuum
 normalised, i.e. exactly what `MEForward` returns).  The returned `params` is the
@@ -416,11 +392,8 @@ params = inv(iquv_obs, initial_guess='sdo_hmi')                    # or go strai
   `ValueError` with the correct `MEInversion(...)` call if they disagree.  Pass
   `strict=False` to downgrade this to a warning.
 * The input spectrum must be **continuum normalised** (`I/Ic, Q/Ic, U/Ic, V/Ic`).
-* Measured performance (8-point forward model on CPU, synthetic HMI-like
-  spectra): ~5300 spectra/s; the network's own spectra are within ≈0.22σ of the
-  truth, so it is an excellent *starting point* (median `chi2/F` 6e-2 vs 1.9 for
-  a random start) but not a final answer — after 40 annealing iterations the
-  inversion reaches `1.6e-4` vs `5.6e-3` (≈36× better).
+* The network output is a *starting point* for the inversion, not a final
+  answer — refine it with `lm` (or an annealing/CMA-ES pass) as in section 5.2.
 * ⚠️ **Wavelength convention to be aware of**: `lambda0 = 6173.3352 Å` is the
   Fe I rest wavelength while the six filter points are centred on the observed
   disk-centre line position 6173.3433 Å (a difference of 8.1 mÅ ≈ 393 m/s).
@@ -460,22 +433,13 @@ phi(u, a) = Re w(u + i a) / sqrt(pi)      with   int phi du = 1
 psi(u, a) = Im w(u + i a) / sqrt(pi)      (Hilbert partner of phi)
 ```
 
-`Re w` is even and `Im w` is odd in `u`, and the rational form is accurate for
-both signs of `u` and for all `a ≥ 0`.  Measured absolute error against
-`scipy.special.wofz` over `|u| ≤ 200`:
-
-| `a` | rational (default) | trapezoidal reference |
-|---|---|---|
-| 0 | 2.5e-6 | **returns exactly 0 (and NaN in places)** |
-| 1e-4 | 2.5e-6 | 5.6e-1 |
-| 0.01 | 2.4e-6 | 4.7e-2 |
-| 0.1 | 1.4e-6 | 1.0e-5 |
-| 0.5 | 2.2e-7 | 7.9e-6 (float32) / 6e-17 (float64) |
-| 1.0 | 3.6e-8 | 1e-5 (float32) |
+`Re w` is even and `Im w` is odd in `u`, and the rational form covers both signs
+of `u` and all `a ≥ 0`.
 
 The `ynodes` / `lim` arguments of the old quadrature are accepted and ignored.
-`|z| ≳ 1.4e5` overflows the polynomial in float32 (CuSP's operating range is
-`|u| ≲ 600`, i.e. ~200× inside the limit).
+The rational form is evaluated in the working dtype, so a sufficiently large
+`|u|` would eventually overflow a float32 polynomial; CuSP's operating range
+stays well inside that limit.
 
 ## 8. Module reference
 
@@ -556,9 +520,7 @@ is the one-shot wrapper, and `make_vectorized_lmcoef(objective, ...)` is the
   GBA driver, but `'cmaes'` is the default method.
 * **Merit values.** `ivs_results['e']` / `['e0']` are always re-evaluated from
   the returned parameters (`x` / `x0`), because the annealers' internal
-  `e_best` can drift out of sync with the `x_best` they return — measured on the
-  HMI test spectrum, the GSA reported an energy ≈70× lower than the merit of the
-  parameters it actually returned.
+  `e_best` can drift out of sync with the `x_best` they return.
 * **LM Jacobian.** `run_lm` gets its Jacobian from
   `me_rf.VectorizedResponseFunction` (one backward pass per Stokes component,
   independent of the wavelength sampling) instead of one backward pass per
@@ -574,26 +536,7 @@ is the one-shot wrapper, and `make_vectorized_lmcoef(objective, ...)` is the
   `CuSP.PI2NN`.  `torch>=2.6` also requires `weights_only=False`, which the
   loader sets when supported.
 
-## 10. Reproducing the validation
-
-The numbers quoted above come from scripts maintained next to this repository
-(`../analysis/` in the author's workspace):
-
-| Script | What it checks |
-|---|---|
-| `verify_voigt_port.py` | Voigt profiles against `scipy.special.wofz` and against the pre-port code (loaded from `git show HEAD:`), shapes/dtypes/autograd, and the speed-up |
-| `probe_rational_domain.py` | validity domain of the rational approximation (signs of `u`, `a → 0`, large `|u|`, float32) |
-| `inspect_pi2nn_pkl.py` | static inspection of a checkpoint's class references |
-| `probe_pi2nn_model.py` | the stored `bounds` / `norm_scale` / `forward_model` of a checkpoint |
-| `validate_pi2nn_initial_guess.py` | end-to-end check of `initial_guess='sdo_hmi'`: network accuracy, annealing improvement, configuration guard |
-| `smoke_pi2nn.py` | `PI2NN` training smoke test (both `dense_spectrum` paths) |
-| `demo_initial_guess_sdo_hmi.py` | the `initial_guess='sdo_hmi'` usage shown above |
-| `verify_readme_snippets.py` | runs every code snippet of this README verbatim, so the documented API cannot drift from the implementation |
-| `verify_two_stage_recipe.py` | the two-stage recipes (random → `cmaes`/`annealing` → `lm`) and the PI2NN → `lm` reference |
-| `check_reported_merit.py` | cross-checks that `ivs_results['e']` equals the merit of `ivs_results['x']` for every method |
-| `check_me_rf.py` | the vectorised response functions (`me_rf.py`) against the loop-over-observables Jacobian, against central finite differences (float64), across layouts/batches/dtypes, and the measured speed-up |
-
-## 11. Citation
+## 10. Citation
 
 If you use `CuSP` in a publication, please cite the accompanying paper:
 
