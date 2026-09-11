@@ -305,14 +305,19 @@ class MEInversion(MEForward):
             iquv_obs: torch.Tensor, observed IQUV with shape (B,4,N)
         ====
         Parameters:
-            method: str, optimization method, default: 'gsa', one of
-                'annealing' (= 'gsa'), 'gsa', 'csa', 'lm', 'cmaes'
+            method: str, optimization method, default: 'cmaes', one of
+                'cmaes', 'annealing' (= 'gsa'), 'gsa', 'csa', 'lm'
+                'cmaes'           : batched CMA-ES (`CuSP.cmaes.BatchCMAES`)
                 'annealing'/'gsa' : generalized simulated annealing (`DualAnnealing`)
                 'csa'             : conjugate simulated annealing (`CudaAnnealing`)
                 'lm'              : batched Levenberg-Marquardt (`CuSP.lm.BatchLM`)
-                'cmaes'           : batched CMA-ES (`CuSP.cmaes.BatchCMAES`)
                 All four minimize the same weighted chi2 over the same normalised
                 parameter box [0, 1]^8 and accept the same `initial_guess`.
+                `cmaes` is the default because it is the only method that makes
+                real progress from the default (random) starting point and is
+                also the cheapest per unit accuracy; pass `method='annealing'`
+                for the paper's GBA, or `method='lm'` once a good guess (e.g.
+                `initial_guess='sdo_hmi'`) is available.
             device: torch.device, device, default: iquv_obs.device
             initial_guess: None | str | torch.Tensor | callable, default: None
                 Starting point of the inversion.  None gives a uniform random guess;
@@ -322,11 +327,10 @@ class MEInversion(MEForward):
                 `f(iquv_obs, inversion=self, device=device)`.
                 `x_guess=` (normalised tensor) is still accepted and takes
                 precedence over `initial_guess`.
-            maxiter / max_iter: int, iterations for 'lm' (default 60) and 'cmaes'
-                (default 200); for the annealing methods it is the number of
+            maxiter / max_iter: int, iterations for 'cmaes' (default 200) and
+                'lm' (default 60); for the annealing methods it is the number of
                 steps per temperature (default 1000)
-            isPrint: bool, print optimizer progress (default False for 'cmaes',
-                True for 'lm')
+            isPrint: bool, print optimizer progress (default False, True for 'lm')
             Other parameters see `CudaAnnealing` / `DualAnnealing` (annealing),
             `CuSP.lm.BatchLM` (lm) or `CuSP.cmaes.BatchCMAES` (cmaes)
         ====
@@ -334,7 +338,7 @@ class MEInversion(MEForward):
             params_ivs: torch.Tensor, inverted parameters
         '''
         self.obsevation['iquv_obs'] = iquv_obs
-        method = kwargs.pop('method', 'gsa')
+        method = kwargs.pop('method', 'cmaes')
         if not isinstance(method, str) or method.lower() not in INVERSION_METHODS:
             raise ValueError(
                 f'Invalid method: {method!r}, support: {", ".join(INVERSION_METHODS)}')
@@ -364,7 +368,8 @@ class MEInversion(MEForward):
                 options = {k: kwargs.pop(k) for k in
                            ('init_damping','damping_mode','damping_adapt','step_solver',
                             'adaptive_init_damping','patience','tol_grad','tol_step','tol_loss',
-                            'max_line_search','trust_region','config') if k in kwargs}
+                            'max_line_search','trust_region','config','rf_method',
+                            'zoom_factor') if k in kwargs}
                 x_best,optimizer = run_lm(objective,x_guess,max_iters=maxiter,
                                           isPrint=is_print,**options)
             else:

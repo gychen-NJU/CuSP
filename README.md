@@ -49,8 +49,9 @@ params = inv(iquv_obs, initial_guess='sdo_hmi')           # PI2NN initial guess
 | Feature | Module | Notes |
 |---|---|---|
 | ME forward synthesis of Stokes `IQUV` | `me_forward.py` | analytic Unno–Rachkovsky solution, fully vectorised, differentiable, device-agnostic |
-| ME inversion (batched, four interchangeable methods) | `me_inversion.py` | `method='annealing'` (generalized SA with a gradient-biased step selection, i.e. the **GBA** algorithm of the paper; recommended), `'lm'` (Levenberg–Marquardt), `'cmaes'` (CMA-ES) or `'csa'` (legacy conjugate SA); GPU-supported |
+| ME inversion (batched, four interchangeable methods) | `me_inversion.py` | `method='cmaes'` (CMA-ES, **default**), `'annealing'` (generalized SA with a gradient-biased step selection, i.e. the **GBA** algorithm of the paper), `'lm'` (Levenberg–Marquardt) or `'csa'` (legacy conjugate SA); GPU-supported |
 | Fast Voigt / Faraday–Voigt profiles | `voigt.py` | 7/7 complex rational approximation of the Faddeeva function — no numerical quadrature, ~13× faster than the original trapezoidal implementation |
+| Vectorised response functions (Jacobians) | `me_rf.py` | element-wise (pixel × wavelength) autodiff: the response functions of all four Stokes components in one backward pass each, so the LM Jacobian no longer scales with the number of wavelength samples |
 | Learned initial guesses | `initial_guess.py` | shipped `PI2NN` network for **SDO/HMI** Fe I 6173 Å spectra: `initial_guess='sdo_hmi'` |
 | Physics-informed neural network inversion | `PI2NN.py` | `InversionNet` (conv + attention + residual FC) with a physics loss, plus a training loop |
 | Example notebooks | `src/CuSP/examples/` | `forward.ipynb`, `inversion.ipynb` |
@@ -88,6 +89,7 @@ CuSP/
     ├── lm.py                # BatchLM        : batched Levenberg-Marquardt
     ├── cmaes.py             # BatchCMAES     : batched CMA-ES
     ├── me_inverters.py      # binds BatchLM / BatchCMAES to the ME problem
+    ├── me_rf.py             # vectorised response functions (LM Jacobian)
     ├── voigt.py             # fast Voigt & Faraday–Voigt profiles
     ├── initial_guess.py     # PI2NN initial guesses (load / register / evaluate)
     ├── PI2NN.py             # physics-informed neural network inversion
@@ -169,9 +171,9 @@ chi2, so they can be compared or swapped with one keyword:
 
 | `method=` | Optimizer | Character |
 |---|---|---|
+| `'cmaes'` | CMA-ES (`CuSP.cmaes.BatchCMAES`) | derivative-free global search; no Jacobian, excellent accuracy per unit time here — **the default**, because it is the only method that makes real progress from the default random start |
 | `'annealing'` (alias `'gsa'`) | generalized simulated annealing with a gradient-biased step selection (`DualAnnealing`) — the paper's **GBA** | stochastic, derivative-free, robust to a poor start |
-| `'lm'` | Levenberg–Marquardt (`CuSP.lm.BatchLM`) | local, uses the analytic Jacobian (autograd); fastest convergence *from a good start*, needs one |
-| `'cmaes'` | CMA-ES (`CuSP.cmaes.BatchCMAES`) | derivative-free global search; no Jacobian, excellent accuracy per unit time here |
+| `'lm'` | Levenberg–Marquardt (`CuSP.lm.BatchLM`) | local, uses the exact Jacobian obtained by autodiff from the vectorised response functions (`me_rf.py`, one backward pass per Stokes component); fastest convergence *from a good start*, needs one |
 | `'csa'` | conjugate simulated annealing (`CudaAnnealing`, legacy) | prints a full epoch log |
 
 ```python
@@ -180,14 +182,14 @@ from CuSP import MEInversion
 inv = MEInversion(torch.tensor(lm).float(), landeG=2.5, lambda0=630.25, wing=wing)
 x0 = inv.make_initial_guess(iquv_obs, initial_guess='random')   # or 'sdo_hmi', see section 6
 
-# (a) generalized / gradient-bias annealing from a random start (the paper's GBA)
-params = inv(iquv_obs, maxiter=200, initial_temp=5230.)
+# (a) CMA-ES -- the default method, no keyword needed
+params = inv(iquv_obs, max_iter=200)
 
-# (b) Levenberg-Marquardt (local: give it a good starting point)
+# (b) generalized / gradient-bias annealing from a random start (the paper's GBA)
+params = inv(iquv_obs, method='annealing', maxiter=200, initial_temp=5230.)
+
+# (c) Levenberg-Marquardt (local: give it a good starting point)
 params = inv(iquv_obs, method='lm', max_iter=60, initial_guess=x0)
-
-# (c) CMA-ES (derivative-free global search)
-params = inv(iquv_obs, method='cmaes', max_iter=200, initial_guess=x0)
 
 # (d) legacy conjugate simulated annealing
 params = inv(iquv_obs, method='csa', max_iter=1000)
@@ -203,9 +205,9 @@ guess; `chi2/dof` is the quantity `merit_function` returns):
 
 | method | `chi2/dof` start → end | wall time | parameter error |
 |---|---|---|---|
-| `annealing` (`maxiter=100`, `initial_temp=0.1`) | 6.9e-2 → 3.2e-3 | 12 s | degenerate: η₀ off by 57 % while the fit looks perfect |
-| `lm` (`max_iter=60`) | 6.9e-2 → **3.7e-13** | 15 s | exact |
-| `cmaes` (`max_iter=200`) | 6.9e-2 → 4.9e-7 | **1.1 s** | 0.23 % (median over the 8 parameters) |
+| `annealing` (`maxiter=100`, `initial_temp=0.1`) | 6.9e-2 → 3.2e-3 | 3.5 s | degenerate: η₀ off by 57 % while the fit looks perfect |
+| `lm` (`max_iter=60`) | 6.9e-2 → **1.8e-13** | 2.1 s | exact |
+| `cmaes` (`max_iter=200`) | 6.9e-2 → 4.9e-7 | **0.3 s** | 0.23 % (median over the 8 parameters) |
 
 With the *default* `initial_temp=5230` the annealer does not improve on the
 starting guess at all here (6.9e-2 → 6.9e-2): that temperature is ~5 orders of
@@ -220,7 +222,8 @@ proposal is accepted.  Tune `initial_temp` to the merit scale of your problem.
   most accurate of the three.
 * **Without a network** (random initial guess) → run **`cmaes` or `annealing`
   first** for the global search, **then `lm`** to refine.  LM alone makes no
-  progress from a random start on this multi-modal problem.
+  progress from a random start on this multi-modal problem.  `cmaes` is the
+  default, so a plain `inv(iquv_obs)` already is that global stage.
 
 ```python
 import torch
@@ -244,22 +247,65 @@ Measured on the HMI spectrum of section 6 (one pixel, CPU, `chi2/dof`):
 
 | starting point | first stage | after `lm` | total time |
 |---|---|---|---|
-| random | `lm` alone | 2.12 → 2.12 (**no progress**) | 15 s |
-| random | `cmaes`, 200 generations | 1.40e-1 → **4.2e-13** | 16 s |
-| random | `annealing`, 100 steps (`initial_temp=0.1`) | 6.40e-2 → **2.2e-13** | 30 s |
-| PI2NN (`'sdo_hmi'`) | – | 6.90e-2 → **3.7e-13** | 15 s |
+| random | `lm` alone | 2.12 → 2.12 (**no progress**) | 2.0 s |
+| random | `cmaes`, 200 generations | 1.40e-1 → **2.18e-13** | 1.9 s |
+| random | `annealing`, 100 steps (`initial_temp=0.1`) | 6.40e-2 → **3.16e-13** | 6.5 s |
+| PI2NN (`'sdo_hmi'`) | – | 6.90e-2 → **1.81e-13** | 2.1 s |
 
-So both global stages put `lm` in the basin of the true solution, and the
-two-stage route costs about the same as `lm` alone.  Two notes:
+So both global stages put `lm` in the basin of the true solution; `cmaes` → `lm`
+is even cheaper than `lm` alone, while `annealing` → `lm` costs a few times more
+but is the more robust of the two global stages.  Two notes:
 
 * the global stage must be allowed to explore: the CMA-ES class default
   (population 10) stalls at `chi2/dof ≈ 0.13` from a random start, which `lm`
   then cannot improve.  `CuSP.me_inverters.run_cmaes` therefore defaults to
   `pop_size=30, bounded=False`, which is tuned for this problem (from the PI2NN
   start it is ~20× more accurate as well);
-* `cmaes` is the cheapest good solution per unit time (1.1 s for
+* `cmaes` is the cheapest good solution per unit time (0.3 s for
   `chi2/dof = 4.9e-7` from the PI2NN start), so for millions of pixels it is the
   natural first pass, with `lm` added only where the extra accuracy is needed.
+
+#### Response functions (Jacobians)
+
+`method='lm'` needs the derivative of the Stokes vector with respect to the eight
+parameters.  The ME forward model is element-wise in the pixel *and* in the
+wavelength, so `CuSP.me_rf` expands the parameters along a wavelength axis, marks
+the expanded tensor as an autograd leaf and then takes **one backward pass per
+Stokes component**: the loop over the `4N` observables disappears and the cost
+stops growing with the wavelength sampling.
+
+```python
+from CuSP import VectorizedResponseFunction
+
+rf = VectorizedResponseFunction(inv)   # an MEForward or MEInversion instance
+rf(x0)                                 # (B, N, 4, 8)  = d(Stokes)/d(normalised params)
+rf(x0, layout='lm')                    # (B, 4*N, 8)  = the Jacobian BatchLM wants
+```
+
+`run_lm` installs it as the default through BatchLM's `usrLMcoef` hook (so
+`lm.py` itself is untouched); `rf_method='loop'` restores the previous
+loop-over-observables Jacobian.  Cost of one LM coefficient evaluation (Jacobian
++ chi2 + gradient + Gauss–Newton matrix, one pixel, CPU, same HMI setup):
+
+| sampling | loop over observables | vectorised response function | speed-up |
+|---|---|---|---|
+| HMI, 6 wavelengths (24 observables) | 90 ms | 17 ms | 5.3× |
+| 50 wavelengths (200 observables) | 0.54 s | 15 ms | 36× |
+| 200 wavelengths (800 observables) | 2.1 s | 14 ms | 148× |
+
+The numbers behind the speed-up are machine independent: the loop method spends
+`4N + 1` backward passes per evaluation, the vectorised one 5 (one per Stokes
+component plus the continuum normalisation), for any `N`.  The same ratio holds on
+a GPU (~5× at `N = 6` and batch sizes 1 … 512), where single-pixel work is still
+launch-bound — use it for batches.  The absolute CPU times above are single-pixel
+measurements and drift with the machine load; the ratios and the pass counts do
+not.
+
+A full `lm` run (60 iterations, one pixel, HMI sampling, PI2NN start) drops from
+4.9 s to 1.5 s for the same answer (`chi2/dof ≈ 2e-13`).  The response functions
+agree with the loop implementation to `2.3e-6` relative (float32) and with
+central finite differences to `2.4e-10` relative (float64) — see `check_me_rf.py`
+in section 10.
 
 `iquv_obs` has shape `(B, 4, N)` (channels ordered `I, Q, U, V`, continuum
 normalised, i.e. exactly what `MEForward` returns).  The returned `params` is the
@@ -276,14 +322,16 @@ Useful keyword arguments (pass through `inv(...)`):
 
 | Keyword | Default | Meaning |
 |---|---|---|
-| `method` | `'annealing'` | `'annealing'` (= `'gsa'`), `'lm'`, `'cmaes'` or `'csa'` |
+| `method` | `'cmaes'` | `'cmaes'`, `'annealing'` (= `'gsa'`), `'lm'` or `'csa'` |
 | `initial_guess` | `None` | see section 6 |
 | `x_guess` | `None` | explicit normalised `(B,8)` start; takes precedence over `initial_guess` |
-| `maxiter` / `max_iter` | `1000` | annealing iterations per temperature |
+| `maxiter` / `max_iter` | `200` | iterations: `cmaes` 200, `lm` 60; for the annealing methods, steps per temperature (1000) |
 | `initial_temp` | `5230.` | starting temperature |
 | `visit`, `accept`, `no_local_search` | `2.62`, `-5.0`, `False` | `gsa` control parameters |
 | `adam` | `{}`, i.e. `nepoch=1000` | local Adam refinement run after the annealing; pass `adam=dict(nepoch=0)` to skip it, or `dict(nepoch=2000, learning_rate=1e-3)` to tune it |
 | `max_batches` | `1e10` | split large batches into chunks of this size |
+| `rf_method` | `'vector'` | how `method='lm'` builds its Jacobian: `'vector'` (`me_rf`, one backward pass per Stokes component) or `'loop'` (one backward pass per observable) |
+| `objective_clamp` | `(-1., 2.)` | box the objective is evaluated in before denormalising (see section 9) |
 | `device` | `iquv_obs.device` | computation device |
 
 ### 5.3 Plotting the result
@@ -467,8 +515,16 @@ sig=…) -> x_best`.
 **`cmaes.py`** — `BatchCMAES(max_iters, pop_size, init_sigma, patience, …)`:
 batched CMA-ES (separable/full covariance) with the same calling convention.
 **`me_inverters.py`** — `MEObjective` (flattened weighted-chi2 objective),
-`run_lm`, `run_cmaes`: the adapters that bind both optimizers to the ME problem
-(same normalised box and the same `sig` as `merit_function`).
+`run_lm(..., rf_method='vector'|'loop')`, `run_cmaes`: the adapters that bind both
+optimizers to the ME problem (same normalised box and the same `sig` as
+`merit_function`).
+
+**`me_rf.py`** — `VectorizedResponseFunction(forward, wavelengths=None, wing=None,
+zoom_factor=1.0)`: element-wise response functions via
+`__call__(x, normalized=True, layout='nw48'|'lm', return_stokes=False)` →
+`(B, N, 4, 8)` or the flat `(B, 4N, 8)` Jacobian; `vectorized_response_function`
+is the one-shot wrapper, and `make_vectorized_lmcoef(objective, ...)` is the
+`_LMcoef`-compatible hook that `run_lm` uses by default.
 
 **`initial_guess.py`** — `load_pi2nn_model`, `PI2NNInitialGuess`
 (`predict_physical`, `predict_normalized`, `check_inversion`, `describe`),
@@ -496,12 +552,22 @@ batched CMA-ES (separable/full covariance) with the same calling convention.
   must not be used on a `PI2NN` instance (see section 5.4).  Loading the shipped
   checkpoint does not hit this, but your own code might.
 * **`method='csa'`** used to crash with `UnboundLocalError: E_init`; this is
-  fixed (`CudaAnnealing._annealing`).  `'gsa'` remains the recommended method.
+  fixed (`CudaAnnealing._annealing`).  `'gsa'`/`'annealing'` remains the paper's
+  GBA driver, but `'cmaes'` is the default method.
 * **Merit values.** `ivs_results['e']` / `['e0']` are always re-evaluated from
   the returned parameters (`x` / `x0`), because the annealers' internal
   `e_best` can drift out of sync with the `x_best` they return — measured on the
   HMI test spectrum, the GSA reported an energy ≈70× lower than the merit of the
   parameters it actually returned.
+* **LM Jacobian.** `run_lm` gets its Jacobian from
+  `me_rf.VectorizedResponseFunction` (one backward pass per Stokes component,
+  independent of the wavelength sampling) instead of one backward pass per
+  observable; `rf_method='loop'` restores the old behaviour.  Both are the exact
+  derivative of `MEObjective.forward`, i.e. of the objective *including* its
+  clamp margin: a parameter sitting outside `objective_clamp` gets a zero
+  Jacobian column, exactly as before.  BatchLM's pyPRT-specific soft bounds
+  penalty is identically zero for the single-group `decomposition=[8]` that
+  `run_lm` configures.
 * **`initial_guess.py` loading.** The shipped checkpoint was saved from a script
   that imported `PI2NN` as a *top-level* module, so `torch.load` alone cannot
   unpickle it; `load_pi2nn_model` remaps those class references to
@@ -525,6 +591,7 @@ The numbers quoted above come from scripts maintained next to this repository
 | `verify_readme_snippets.py` | runs every code snippet of this README verbatim, so the documented API cannot drift from the implementation |
 | `verify_two_stage_recipe.py` | the two-stage recipes (random → `cmaes`/`annealing` → `lm`) and the PI2NN → `lm` reference |
 | `check_reported_merit.py` | cross-checks that `ivs_results['e']` equals the merit of `ivs_results['x']` for every method |
+| `check_me_rf.py` | the vectorised response functions (`me_rf.py`) against the loop-over-observables Jacobian, against central finite differences (float64), across layouts/batches/dtypes, and the measured speed-up |
 
 ## 11. Citation
 

@@ -34,6 +34,7 @@ import torch
 
 from .cmaes import BatchCMAES
 from .lm import BatchLM
+from .me_rf import make_vectorized_lmcoef
 
 __all__ = ["MEObjective", "run_lm", "run_cmaes"]
 
@@ -108,21 +109,50 @@ class MEObjective:
 # drivers
 # --------------------------------------------------------------------------- #
 def run_lm(objective: MEObjective, x_guess: torch.Tensor, max_iters: int = 60,
-           isPrint: bool = False, config: dict | None = None, **options):
+           isPrint: bool = False, config: dict | None = None,
+           rf_method: str = 'vector', zoom_factor: float | None = None,
+           **options):
     """Run :class:`CuSP.lm.BatchLM` on the ME objective.
+
+    ``rf_method`` selects how the Jacobian is obtained:
+
+    ``'vector'`` (default)
+        :class:`CuSP.me_rf.VectorizedResponseFunction`: the parameters are
+        expanded along a wavelength axis and the response function is built with
+        one backward pass per Stokes component, so the cost does not grow with
+        the number of wavelength samples.  Installed through BatchLM's
+        ``usrLMcoef`` hook, i.e. without touching ``lm.py``.
+    ``'loop'``
+        BatchLM's own Jacobian (one backward pass per observable,
+        ``4 * Nw`` passes), kept as a reference implementation.
 
     Returns ``(x_best, optimizer)``; ``x_best`` is in normalised parameter space.
     """
     n_param = int(x_guess.size(1))
     # decomposition=[n_param] keeps BatchLM's pyPRT-specific per-group bound logic
     # (vLos in km/s, gamma/phi in [0, pi], ...) inert; the ME box is handled by
-    # MEObjective.clamp instead.
+    # MEObjective.clamp instead.  Note that for this single-group configuration
+    # BatchLM's soft bounds penalty is identically zero, which is why the
+    # vectorised `usrLMcoef` below can leave it out.
     cfg = dict(decomposition=[n_param])
     if config:
         cfg.update(config)
     optimizer = BatchLM(max_iters=max_iters, forward=objective.forward, **options)
-    x_best = optimizer(objective.Y, x_guess, sig=objective.sig, config=cfg,
-                       isPrint=isPrint, device=objective.device, dtype=objective.dtype)
+    if rf_method == 'vector':
+        usrLMcoef = make_vectorized_lmcoef(
+            objective,
+            zoom_factor=1.0 if zoom_factor is None else float(zoom_factor))
+    elif rf_method in ('loop', 'legacy', 'autograd', None):
+        usrLMcoef = None
+    else:
+        raise ValueError(f"rf_method must be 'vector' or 'loop', got {rf_method!r}")
+    call_kwargs = dict(sig=objective.sig, config=cfg, isPrint=isPrint,
+                       device=objective.device, dtype=objective.dtype)
+    if usrLMcoef is not None:
+        call_kwargs['usrLMcoef'] = usrLMcoef
+    elif zoom_factor is not None:
+        call_kwargs['zoom_factor'] = float(zoom_factor)
+    x_best = optimizer(objective.Y, x_guess, **call_kwargs)
     # BatchLM's own "best" bookkeeping is reset whenever its stall-recovery
     # perturbes the current point (lm.py resets best_chi2 to the perturbed x0
     # without resetting best_x), so the returned point can be worse than the

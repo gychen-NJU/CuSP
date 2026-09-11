@@ -99,6 +99,19 @@ class MEForward:
         wavebands = self.wavebands.unsqueeze(0).to(Dlambda_D.device).to(Dlambda_D.dtype)
         # print(wavebands.device, Dlambda_D.device)
         u0 = (wavebands-self.lambda0)/Dlambda_D
+        return self.profile_from_u(u0,u_los,u_B,a_damp)
+
+    def profile_from_u(self,u0,u_los,u_B,a_damp):
+        '''
+        Return the absorption and dispersion profiles for an explicit reduced
+        detuning `u0`, which may be any tensor broadcastable against
+        `u_los`/`u_B`/`a_damp` (typically `(N,N_lambda)`).
+
+        `return_profile` is just this function evaluated on `self.wavebands`;
+        keeping the six Voigt evaluations in one place means a caller that
+        supplies its own `u0` grid (`CuSP.me_rf.VectorizedResponseFunction`)
+        uses exactly the same line-profile convention as the forward model.
+        '''
         G  = self.G
         phi_0 = VoigtProfile(u0-u_los      , a_damp)
         phi_B = VoigtProfile(u0-u_los+G*u_B, a_damp)
@@ -122,6 +135,25 @@ class MEForward:
         rho_V = eta_0/2*(psi_R-psi_B)*torch.cos(theta)
         return eta_I, eta_Q, eta_U, eta_V, rho_Q, rho_U, rho_V
 
+    def stokes_from_eta_rho(self,eta_I,eta_Q,eta_U,eta_V,rho_Q,rho_U,rho_V,S10):
+        '''
+        Return the Stokes vector at optical depth tau=0 from the propagation
+        matrix elements `eta_{I,Q,U,V}` and `rho_{Q,U,V}` (not yet normalised by
+        the continuum).
+
+        `return_IQUV` is this function divided by its Stokes-I value at the
+        wing; splitting it out lets a caller evaluate the same physics on any
+        element-wise (parameter, wavelength) grid.
+        '''
+        Delta   = eta_I**2*(eta_I**2-eta_Q**2-eta_U**2-eta_V**2+rho_Q**2+rho_U**2+rho_V**2)-(eta_Q*rho_Q+eta_U*rho_U+eta_V*rho_V)**2
+        Delta_r = 1/Delta
+
+        I_tau0  = 1+Delta_r*eta_I*(eta_I**2+rho_Q**2+rho_U**2+rho_V**2)*S10
+        Q_tau0  = Delta_r*(eta_I**2*eta_Q+eta_I*(eta_V*rho_U-eta_U*rho_V)+rho_Q*(eta_Q*rho_Q+eta_U*rho_U+eta_V*rho_V))*S10
+        U_tau0  = Delta_r*(eta_I**2*eta_U+eta_I*(eta_Q*rho_V-eta_V*rho_Q)+rho_U*(eta_Q*rho_Q+eta_U*rho_U+eta_V*rho_V))*S10
+        V_tau0  = Delta_r*(eta_I**2*eta_V+eta_I*(eta_U*rho_Q-eta_Q*rho_U)+rho_V*(eta_Q*rho_Q+eta_U*rho_U+eta_V*rho_V))*S10
+        return I_tau0,Q_tau0,U_tau0,V_tau0
+
     def return_IQUV(self,Dlambda_D,v_los,eta_0,S10,a_damp,Bmag,theta,phi):
         '''
         Return:
@@ -136,14 +168,8 @@ class MEForward:
         u_B = lambdaB/Dlambda_D
         phi_0,phi_B,phi_R,psi_0,psi_B,psi_R = self.return_profile(Dlambda_D,u_los,u_B,a_damp)
         eta_I, eta_Q, eta_U, eta_V, rho_Q, rho_U, rho_V = self.return_eta_rho(eta_0,theta,phi,phi_0,phi_B,phi_R,psi_0,psi_B,psi_R)
-        Delta   = eta_I**2*(eta_I**2-eta_Q**2-eta_U**2-eta_V**2+rho_Q**2+rho_U**2+rho_V**2)-(eta_Q*rho_Q+eta_U*rho_U+eta_V*rho_V)**2
-        Delta_r = 1/Delta
-        
-        I_tau0  = 1+Delta_r*eta_I*(eta_I**2+rho_Q**2+rho_U**2+rho_V**2)*S10
-        Q_tau0  = Delta_r*(eta_I**2*eta_Q+eta_I*(eta_V*rho_U-eta_U*rho_V)+rho_Q*(eta_Q*rho_Q+eta_U*rho_U+eta_V*rho_V))*S10
-        U_tau0  = Delta_r*(eta_I**2*eta_U+eta_I*(eta_Q*rho_V-eta_V*rho_Q)+rho_U*(eta_Q*rho_Q+eta_U*rho_U+eta_V*rho_V))*S10
-        V_tau0  = Delta_r*(eta_I**2*eta_V+eta_I*(eta_U*rho_Q-eta_Q*rho_U)+rho_V*(eta_Q*rho_Q+eta_U*rho_U+eta_V*rho_V))*S10
-        
+        I_tau0, Q_tau0, U_tau0, V_tau0 = self.stokes_from_eta_rho(eta_I,eta_Q,eta_U,eta_V,rho_Q,rho_U,rho_V,S10)
+
         Ic      = I_tau0[:,0:1]
         I0      = I_tau0[:,1:]/Ic
         Q0      = Q_tau0[:,1:]/Ic

@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from CuSP import MEForward, MEInversion, get_initial_guess_model
 
 HERE = Path(__file__).resolve().parent
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 PARAM_NAMES = ["Dlambda_D", "v_los", "eta_0", "S10", "a_damp", "Bmag", "theta", "phi"]
 PARAM_UNITS = ["nm", "m/s", "-", "-", "-", "G", "rad", "rad"]
@@ -30,10 +31,11 @@ def print_table(header, rows):
 
 
 def synthesize(forward, params, dtype=torch.float32):
-    params = torch.tensor(np.asarray(params, dtype=np.float64).reshape(1, 8), dtype=dtype)
+    params = torch.tensor(np.asarray(params, dtype=np.float64).reshape(1, 8), dtype=dtype,
+                          device=forward.wavebands.device)
     with torch.no_grad():
         out = forward(*[params[:, k:k + 1] for k in range(8)])
-    return out[:, 0, :].numpy()
+    return out[:, 0, :].detach().cpu().numpy()
 
 
 def plot_comparison(path, title, wavelengths, dense_wavelengths, target_points, target_dense,
@@ -60,7 +62,7 @@ def plot_comparison(path, title, wavelengths, dense_wavelengths, target_points, 
 
 
 ig = get_initial_guess_model("sdo_hmi")
-WAVEBANDS = ig.wavebands.clone()
+WAVEBANDS = ig.wavebands.clone().to(DEVICE)
 LAMBDA0 = ig.lambda0
 LANDE_G = ig.landeG
 WING = ig.wing
@@ -69,27 +71,31 @@ DENSE = np.linspace(CENTER_A / 10.0 - 0.018, CENTER_A / 10.0 + 0.018, 400)
 
 inv = MEInversion(WAVEBANDS.clone(), landeG=LANDE_G, lambda0=LAMBDA0, wing=WING)
 forward_hmi = MEForward(WAVEBANDS.clone(), landeG=LANDE_G, lambda0=LAMBDA0, wing=WING)
-forward_dense = MEForward(torch.tensor(DENSE, dtype=torch.float32), landeG=LANDE_G,
+forward_dense = MEForward(torch.tensor(DENSE, dtype=torch.float32, device=DEVICE), landeG=LANDE_G,
                           lambda0=LAMBDA0, wing=WING)
 
 torch.manual_seed(0)
 np.random.seed(0)
 
-obs = inv.synthesize(torch.tensor(TRUTH, dtype=torch.float32).reshape(1, 8))
+obs = inv.synthesize(torch.tensor(TRUTH, dtype=torch.float32, device=DEVICE).reshape(1, 8))
 x_guess = inv.make_initial_guess(obs, initial_guess=None)
-merit_start = float(np.asarray(inv.merit_function(
-    obs, inv.synthesize(inv.denormalizing_parameter(x_guess)))).reshape(-1)[0])
+merit_start = float(inv.merit_function(
+    obs, inv.synthesize(inv.denormalizing_parameter(x_guess))).detach().cpu().reshape(-1)[0])
 
-params_cmaes = inv(obs, method="cmaes", max_iter=500, initial_guess=x_guess, isPrint=False)
+params_cmaes = inv(obs, method="cmaes", max_iter=500, initial_guess=x_guess, isPrint=False,
+                   device=DEVICE)
 merit_cmaes = float(np.asarray(inv.ivs_results["e"]).reshape(-1)[0])
 
 x_refine = inv.normalizing_parameter(torch.as_tensor(params_cmaes))
-params_lm = inv(obs, method="lm", max_iter=60, initial_guess=x_refine, isPrint=False)
+params_lm = inv(obs, method="lm", max_iter=60, initial_guess=x_refine, isPrint=False,
+                device=DEVICE)
 merit_lm = float(np.asarray(inv.ivs_results["e"]).reshape(-1)[0])
 
-params_cmaes = params_cmaes.detach().numpy()[0]
-params_lm = params_lm.detach().numpy()[0]
+params_cmaes = params_cmaes.detach().cpu().numpy()[0]
+params_lm = params_lm.detach().cpu().numpy()[0]
 
+print()
+print(f"device: {DEVICE}")
 print()
 print_table(
     ["parameter", "unit", "truth", "cmaes", "cmaes+lm", "rel.err(cmaes+lm)"],

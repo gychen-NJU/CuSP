@@ -47,8 +47,9 @@ params = inv(iquv_obs, initial_guess='sdo_hmi')           # 用 PI2NN 给初猜
 | 功能 | 模块 | 说明 |
 |---|---|---|
 | ME 前向合成 Stokes `IQUV` | `me_forward.py` | Unno–Rachkovsky 解析解，全向量化、可微、与设备无关 |
-| ME 反演（四种方法可互换） | `me_inversion.py` | `method='annealing'`（带梯度偏置步长选择的广义模拟退火，即论文的 **GBA**，推荐）、`'lm'`（Levenberg–Marquardt）、`'cmaes'`（CMA-ES）或 `'csa'`（旧的共轭模拟退火）；支持 GPU |
+| ME 反演（四种方法可互换） | `me_inversion.py` | `method='cmaes'`（CMA-ES，**默认**）、`'annealing'`（带梯度偏置步长选择的广义模拟退火，即论文的 **GBA**）、`'lm'`（Levenberg–Marquardt）或 `'csa'`（旧的共轭模拟退火）；支持 GPU |
 | 快速 Voigt / Faraday–Voigt 线型 | `voigt.py` | 用 Faddeeva 函数的 7/7 复有理逼近——不做数值积分，比原梯形积分快约 13 倍 |
+| 向量化响应函数（Jacobian） | `me_rf.py` | 按（像素 × 波长）逐元素自动微分：四个 Stokes 分量各一次反向传播就能得到响应函数，`lm` 的 Jacobian 不再随波长采样数增长 |
 | 学习型初猜 | `initial_guess.py` | 内置 **SDO/HMI** Fe I 6173 Å 的 `PI2NN` 网络：`initial_guess='sdo_hmi'` |
 | 物理信息神经网络反演 | `PI2NN.py` | `InversionNet`（卷积 + 注意力 + 残差全连接）+ 物理损失，含训练循环 |
 | 示例 notebook | `src/CuSP/examples/` | `forward.ipynb`、`inversion.ipynb` |
@@ -86,6 +87,7 @@ CuSP/
     ├── lm.py                # BatchLM        ：批量 Levenberg-Marquardt
     ├── cmaes.py             # BatchCMAES     ：批量 CMA-ES
     ├── me_inverters.py      # 把 BatchLM / BatchCMAES 接到 ME 问题上
+    ├── me_rf.py             # 向量化响应函数（lm 的 Jacobian）
     ├── voigt.py             # 快速 Voigt 与 Faraday–Voigt 线型
     ├── initial_guess.py     # PI2NN 初猜（加载 / 注册 / 推理）
     ├── PI2NN.py             # 物理信息神经网络反演
@@ -164,9 +166,9 @@ iquv = torch.stack([I, Q, U, V], dim=1)                                        #
 
 | `method=` | 优化器 | 特点 |
 |---|---|---|
+| `'cmaes'` | CMA-ES（`CuSP.cmaes.BatchCMAES`） | 无梯度的全局搜索；本问题上单位时间精度最好——**默认方法**，因为它是唯一能从默认（随机）初值真正推进的方法 |
 | `'annealing'`（别名 `'gsa'`） | 带梯度偏置步长选择的广义模拟退火（`DualAnnealing`），即论文的 **GBA** | 随机、无需梯度、对差初值较稳健 |
-| `'lm'` | Levenberg–Marquardt（`CuSP.lm.BatchLM`） | 局部方法，用解析 Jacobian（autograd）；**好初值下**收敛最快最准 |
-| `'cmaes'` | CMA-ES（`CuSP.cmaes.BatchCMAES`） | 无梯度的全局搜索；本问题上单位时间精度最好 |
+| `'lm'` | Levenberg–Marquardt（`CuSP.lm.BatchLM`） | 局部方法，Jacobian 由向量化响应函数（`me_rf.py`，每个 Stokes 分量一次反向传播）精确自动微分得到；**好初值下**收敛最快最准 |
 | `'csa'` | 共轭模拟退火（`CudaAnnealing`，旧） | 会打印完整 epoch 日志 |
 
 ```python
@@ -175,14 +177,14 @@ from CuSP import MEInversion
 inv = MEInversion(torch.tensor(lm).float(), landeG=2.5, lambda0=630.25, wing=wing)
 x0 = inv.make_initial_guess(iquv_obs, initial_guess='random')   # 或 'sdo_hmi'，见第 6 节
 
-# (a) 随机初猜 + 广义/梯度偏置模拟退火（即论文的 GBA）
-params = inv(iquv_obs, maxiter=200, initial_temp=5230.)
+# (a) CMA-ES —— 默认方法，不用给关键字
+params = inv(iquv_obs, max_iter=200)
 
-# (b) Levenberg-Marquardt（局部方法，要给好初值）
+# (b) 随机初猜 + 广义/梯度偏置模拟退火（即论文的 GBA）
+params = inv(iquv_obs, method='annealing', maxiter=200, initial_temp=5230.)
+
+# (c) Levenberg-Marquardt（局部方法，要给好初值）
 params = inv(iquv_obs, method='lm', max_iter=60, initial_guess=x0)
-
-# (c) CMA-ES（无梯度全局搜索）
-params = inv(iquv_obs, method='cmaes', max_iter=200, initial_guess=x0)
 
 # (d) 旧的共轭模拟退火
 params = inv(iquv_obs, method='csa', max_iter=1000)
@@ -196,9 +198,9 @@ params = inv(iquv_obs, method='csa', max_iter=1000)
 
 | 方法 | `chi2/dof` 起点 → 终点 | 耗时 | 参数误差 |
 |---|---|---|---|
-| `annealing`（`maxiter=100`、`initial_temp=0.1`） | 6.9e-2 → 3.2e-3 | 12 s | 退化：拟合看着完美但 η₀ 偏 57% |
-| `lm`（`max_iter=60`） | 6.9e-2 → **3.7e-13** | 15 s | 精确 |
-| `cmaes`（`max_iter=200`） | 6.9e-2 → 4.9e-7 | **1.1 s** | 8 个参数的中位相对误差 0.23% |
+| `annealing`（`maxiter=100`、`initial_temp=0.1`） | 6.9e-2 → 3.2e-3 | 3.5 s | 退化：拟合看着完美但 η₀ 偏 57% |
+| `lm`（`max_iter=60`） | 6.9e-2 → **1.8e-13** | 2.1 s | 精确 |
+| `cmaes`（`max_iter=200`） | 6.9e-2 → 4.9e-7 | **0.3 s** | 8 个参数的中位相对误差 0.23% |
 
 若用默认的 `initial_temp=5230`，退火在本问题上**完全没有改善初值**（6.9e-2 → 6.9e-2）：
 该温度比这里的 merit 量级（`chi2/dof ≈ 1e-2`）高约 5 个数量级，几乎任何试探都被接受。
@@ -209,7 +211,8 @@ params = inv(iquv_obs, method='csa', max_iter=1000)
 * **有网络提供初猜**（例如 `initial_guess='sdo_hmi'`）→ 直接用 **`lm`**。
   它是局部方法，只要初值够好就能精确收敛，是三者里最准的。
 * **没有网络（随机初猜）** → **先跑 `cmaes` 或 `annealing` 做全局搜索，再交给
-  `lm` 精修**。在这个多峰问题上，单独用 `lm` 从随机初值出发完全没有进展。
+  `lm` 精修**。在这个多峰问题上，单独用 `lm` 从随机初值出发完全没有进展；`cmaes`
+  就是默认方法，所以直接 `inv(iquv_obs)` 已经跑完那个全局段。
 
 ```python
 import torch
@@ -232,19 +235,54 @@ p2 = inv_hmi(iquv_obs_hmi, method='lm', max_iter=60, initial_guess='sdo_hmi')
 
 | 初猜 | 第一段 | 接 `lm` 之后 | 总耗时 |
 |---|---|---|---|
-| 随机 | 只用 `lm` | 2.12 → 2.12（**无进展**） | 15 s |
-| 随机 | `cmaes`，200 代 | 1.40e-1 → **4.2e-13** | 16 s |
-| 随机 | `annealing`，100 步（`initial_temp=0.1`） | 6.40e-2 → **2.2e-13** | 30 s |
-| PI2NN（`'sdo_hmi'`） | – | 6.90e-2 → **3.7e-13** | 15 s |
+| 随机 | 只用 `lm` | 2.12 → 2.12（**无进展**） | 2.0 s |
+| 随机 | `cmaes`，200 代 | 1.40e-1 → **2.18e-13** | 1.9 s |
+| 随机 | `annealing`，100 步（`initial_temp=0.1`） | 6.40e-2 → **3.16e-13** | 6.5 s |
+| PI2NN（`'sdo_hmi'`） | – | 6.90e-2 → **1.81e-13** | 2.1 s |
 
-可见两个全局方法都能把 `lm` 送进真解所在的盆地，两段式总耗时与单跑 `lm` 相当。
-两点注意：
+可见两个全局方法都能把 `lm` 送进真解所在的盆地；`cmaes` → `lm` 甚至比单跑 `lm`
+还便宜，`annealing` → `lm` 贵几倍但更稳健。两点注意：
 
 * 全局段必须给够探索能力：CMA-ES 的类默认种群（10）从随机初值出发会卡在
   `chi2/dof ≈ 0.13`，`lm` 也就无从改进。因此 `CuSP.me_inverters.run_cmaes` 的默认
   改为 `pop_size=30, bounded=False`（针对本问题调过；从 PI2NN 初值出发也准约 20 倍）。
-* `cmaes` 的单位时间性价比最高（从 PI2NN 初猜出发 1.1 s 就到 `chi2/dof = 4.9e-7`），
+* `cmaes` 的单位时间性价比最高（从 PI2NN 初猜出发 0.3 s 就到 `chi2/dof = 4.9e-7`），
   因此上百万像素时适合做第一遍，再对需要更高精度的地方补 `lm`。
+
+#### 响应函数（Jacobian）
+
+`method='lm'` 需要 Stokes 矢量对八个参数的导数。ME 前向模型在像素和波长两个维度上都是
+逐元素独立的，因此 `CuSP.me_rf` 把参数沿一条新的波长轴展开、把展开后的张量标记为 autograd
+叶子节点，然后**每个 Stokes 分量只做一次反向传播**——对 `4N` 个观测量逐个反向的循环消失了，
+代价不再随波长采样数增长。
+
+```python
+from CuSP import VectorizedResponseFunction
+
+rf = VectorizedResponseFunction(inv)   # 传 MEForward 或 MEInversion 实例
+rf(x0)                                 # (B, N, 4, 8)  = d(Stokes)/d(归一化参数)
+rf(x0, layout='lm')                    # (B, 4*N, 8)  = BatchLM 需要的 Jacobian
+```
+
+`run_lm` 通过 BatchLM 的 `usrLMcoef` 钩子把它装成默认实现（`lm.py` 本身不用改）；
+传 `rf_method='loop'` 可以退回原来"逐个观测量反向"的 Jacobian。单次 LM 系数计算
+（Jacobian + chi2 + 梯度 + Gauss–Newton 矩阵，单像素、CPU、同一套 HMI 配置）的耗时：
+
+| 采样 | 逐个观测量反向 | 向量化响应函数 | 加速 |
+|---|---|---|---|
+| HMI 6 个波长（24 观测量） | 90 ms | 17 ms | 5.3× |
+| 50 个波长（200 观测量） | 0.54 s | 15 ms | 36× |
+| 200 个波长（800 观测量） | 2.1 s | 14 ms | 148× |
+
+加速比背后的量是与机器无关的：逐个观测量方法每次计算要 `4N + 1` 次反向传播，向量化
+方法固定 5 次（4 个 Stokes 分量各一次 + 连续谱归一化一次），与 `N` 无关。GPU 上比例
+相同（`N = 6`、批量 1…512 下约 5×），但单像素在 GPU 上是启动开销主导——批量才划算。
+上表的 CPU 绝对耗时是单像素实测值，会随机器负载浮动；加速比与反向传播次数不会。
+
+完整跑一次 `lm`（60 次迭代、单像素、HMI 采样、PI2NN 初值）从 4.9 s 降到 1.5 s，
+结果一致（`chi2/dof ≈ 2e-13`）。响应函数与原逐个观测量实现的一致度为相对 `2.3e-6`
+（float32），与中心差分的一致度为相对 `2.4e-10`（float64）——见第 10 节的
+`check_me_rf.py`。
 
 `iquv_obs` 形状为 `(B, 4, N)`（通道顺序 `I, Q, U, V`，连续谱归一化，即
 `MEForward` 的输出）。返回的 `params` 是物理量 `(B, 8)`；归一化的起点/终点与
@@ -260,14 +298,16 @@ inv.ivs_results.keys()   # dict_keys(['x0', 'e0', 'x', 'e'])
 
 | 关键字 | 默认值 | 含义 |
 |---|---|---|
-| `method` | `'annealing'` | `'annealing'`（= `'gsa'`）、`'lm'`、`'cmaes'` 或 `'csa'` |
+| `method` | `'cmaes'` | `'cmaes'`、`'annealing'`（= `'gsa'`）、`'lm'` 或 `'csa'` |
 | `initial_guess` | `None` | 见第 6 节 |
 | `x_guess` | `None` | 显式的归一化 `(B,8)` 起点，优先于 `initial_guess` |
-| `maxiter` / `max_iter` | `1000` | 每个温度下的退火步数 |
+| `maxiter` / `max_iter` | `200` | 迭代数：`cmaes` 200、`lm` 60；退火方法则是每个温度下的步数（1000） |
 | `initial_temp` | `5230.` | 起始温度 |
 | `visit`、`accept`、`no_local_search` | `2.62`、`-5.0`、`False` | `gsa` 的控制参数 |
 | `adam` | `{}`，即 `nepoch=1000` | 退火之后跑的局部 Adam 精修；传 `adam=dict(nepoch=0)` 可跳过，`dict(nepoch=2000, learning_rate=1e-3)` 可调节 |
 | `max_batches` | `1e10` | 大批量按此尺寸分块 |
+| `rf_method` | `'vector'` | `method='lm'` 计算 Jacobian 的方式：`'vector'`（`me_rf`，每个 Stokes 分量一次反向）或 `'loop'`（每个观测量一次反向） |
+| `objective_clamp` | `(-1., 2.)` | 反归一化前计算目标函数所用的盒（见第 9 节） |
 | `device` | `iquv_obs.device` | 计算设备 |
 
 ### 5.3 画图
@@ -437,9 +477,16 @@ visit, accept, no_local_search)`，以及 `GSA`、`VisitDistribution`、`EnergyS
 可微 `forward(x)` 上的批量 Levenberg–Marquardt，`__call__(Y, guess, sig=…) -> x_best`。
 **`cmaes.py`** —— `BatchCMAES(max_iters, pop_size, init_sigma, patience, …)`：
 批量 CMA-ES（对角/完整协方差），调用约定相同。
-**`me_inverters.py`** —— `MEObjective`（展平的加权 chi2 目标函数）、`run_lm`、
-`run_cmaes`：把两个优化器接到 ME 问题上的适配层（同一个归一化盒、与
-`merit_function` 相同的 `sig`）。
+**`me_inverters.py`** —— `MEObjective`（展平的加权 chi2 目标函数）、
+`run_lm(..., rf_method='vector'|'loop')`、`run_cmaes`：把两个优化器接到 ME 问题上的
+适配层（同一个归一化盒、与 `merit_function` 相同的 `sig`）。
+
+**`me_rf.py`** —— `VectorizedResponseFunction(forward, wavelengths=None, wing=None,
+zoom_factor=1.0)`：逐元素响应函数，
+`__call__(x, normalized=True, layout='nw48'|'lm', return_stokes=False)` 返回
+`(B, N, 4, 8)` 或展平的 `(B, 4N, 8)` Jacobian；`vectorized_response_function` 是
+一次性调用封装，`make_vectorized_lmcoef(objective, ...)` 是 `run_lm` 默认使用的
+`_LMcoef` 兼容钩子。
 
 **`initial_guess.py`** —— `load_pi2nn_model`、`PI2NNInitialGuess`
 （`predict_physical`、`predict_normalized`、`check_inversion`、`describe`）、
@@ -464,10 +511,17 @@ visit, accept, no_local_search)`，以及 `GSA`、`VisitDistribution`、`EnergyS
 * **`PI2NN` 与 `nn.Module`**：`PI2NN.train` 是训练循环，因此**不要**对 `PI2NN`
   实例用 `.eval()`（见 5.4 节）。加载内置权重不会触发这一点，但你自己的代码可能。
 * **`method='csa'`** 曾因 `UnboundLocalError: E_init` 必崩，现已修复
-  （`CudaAnnealing._annealing`）；仍推荐 `'gsa'`。
+  （`CudaAnnealing._annealing`）；`'gsa'`/`'annealing'` 仍是论文的 GBA 驱动，
+  但默认方法是 `'cmaes'`。
 * **merit 数值**：`ivs_results['e']` / `['e0']` 一律由返回的参数（`x` / `x0`）
   重新计算，因为退火器内部的 `e_best` 可能和它返回的 `x_best` 不同步——在 HMI
   测试谱上实测到 GSA 报出的能量比它实际返回参数的 merit 低约 70 倍。
+* **LM 的 Jacobian**：`run_lm` 默认用 `me_rf.VectorizedResponseFunction` 求 Jacobian
+  （每个 Stokes 分量一次反向传播，代价与波长采样数无关），而不是逐个观测量反向；
+  `rf_method='loop'` 可退回旧行为。两者都是 `MEObjective.forward` 的精确导数，即
+  *包含* clamp 余量的目标函数的导数：落在 `objective_clamp` 之外的参数其 Jacobian
+  列为 0，与旧实现完全一致。另外 BatchLM 里 pyPRT 专用的软边界惩罚项，在 `run_lm`
+  配置的单组 `decomposition=[8]` 下恒为 0。
 * **`initial_guess.py` 的加载**：内置 checkpoint 是脚本以*顶层*模块 `PI2NN`
   保存的，直接 `torch.load` 无法反序列化，`load_pi2nn_model` 会把那些类引用映射
   到 `CuSP.PI2NN`。`torch>=2.6` 还需要 `weights_only=False`，加载器在支持时会自动传。
@@ -488,6 +542,7 @@ visit, accept, no_local_search)`，以及 `GSA`、`VisitDistribution`、`EnergyS
 | `verify_readme_snippets.py` | 把本 README 里的每段代码原样跑一遍，保证文档里的 API 不会与实现脱节 |
 | `verify_two_stage_recipe.py` | 两段式路线（随机 → `cmaes`/`annealing` → `lm`）与 PI2NN → `lm` 参照 |
 | `check_reported_merit.py` | 交叉核对每种方法的 `ivs_results['e']` 是否等于 `ivs_results['x']` 的 merit |
+| `check_me_rf.py` | 向量化响应函数（`me_rf.py`）对照逐个观测量 Jacobian、对照 float64 中心差分，以及布局/批量/数据类型与实测加速比 |
 
 ## 11. 引用
 

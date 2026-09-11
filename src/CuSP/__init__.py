@@ -18,6 +18,11 @@ from .initial_guess import (
     register_initial_guess,
 )
 from .me_inverters import MEObjective, run_cmaes, run_lm
+from .me_rf import (
+    VectorizedResponseFunction,
+    make_vectorized_lmcoef,
+    vectorized_response_function,
+)
 from .lm import BatchLM
 from .cmaes import BatchCMAES
 
@@ -33,6 +38,9 @@ __all__ = [
     'MEObjective',
     'run_lm',
     'run_cmaes',
+    'VectorizedResponseFunction',
+    'vectorized_response_function',
+    'make_vectorized_lmcoef',
     'BatchLM',
     'BatchCMAES',
 ]
