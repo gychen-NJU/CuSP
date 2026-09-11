@@ -95,7 +95,9 @@ CuSP/
     │   └── pi2nn_sdo_hmi.pkl  # trained PI2NN weights for SDO/HMI
     └── examples/
         ├── forward.ipynb    # forward-model tutorial
-        └── inversion.ipynb  # inversion tutorial
+        ├── inversion.ipynb  # inversion tutorial
+        ├── inversion_random_cmaes_lm.py   # random start -> CMA-ES -> LM
+        └── inversion_pi2nn_lm.py          # PI2NN start -> LM
 ```
 
 ## 4. The eight ME parameters
@@ -201,9 +203,9 @@ guess; `chi2/dof` is the quantity `merit_function` returns):
 
 | method | `chi2/dof` start → end | wall time | parameter error |
 |---|---|---|---|
-| `annealing` (`maxiter=100`, `initial_temp=0.1`) | 6.9e-2 → 3.2e-3 | 18 s | degenerate: η₀ off by 57 % while the fit looks perfect |
-| `lm` (`max_iter=60`) | 6.9e-2 → **3.7e-13** | 19 s | exact |
-| `cmaes` (`max_iter=200`) | 6.9e-2 → 9.1e-6 | **1.1 s** | ≤ 9 % per parameter |
+| `annealing` (`maxiter=100`, `initial_temp=0.1`) | 6.9e-2 → 3.2e-3 | 12 s | degenerate: η₀ off by 57 % while the fit looks perfect |
+| `lm` (`max_iter=60`) | 6.9e-2 → **3.7e-13** | 15 s | exact |
+| `cmaes` (`max_iter=200`) | 6.9e-2 → 4.9e-7 | **1.1 s** | 0.23 % (median over the 8 parameters) |
 
 With the *default* `initial_temp=5230` the annealer does not improve on the
 starting guess at all here (6.9e-2 → 6.9e-2): that temperature is ~5 orders of
@@ -224,8 +226,8 @@ proposal is accepted.  Tune `initial_temp` to the merit scale of your problem.
 import torch
 
 # --- no network available: global search first, then LM refinement ----------
-p1 = inv(iquv_obs, method='annealing', maxiter=100, initial_temp=0.1)
-# p1 = inv(iquv_obs, method='cmaes', max_iter=200)      # alternative global stage
+p1 = inv(iquv_obs, method='cmaes', max_iter=200)
+# p1 = inv(iquv_obs, method='annealing', maxiter=100, initial_temp=0.1)
 x1 = inv.normalizing_parameter(torch.as_tensor(p1))     # back to the [0, 1]^8 box
 p2 = inv(iquv_obs, method='lm', max_iter=60, initial_guess=x1)
 
@@ -234,24 +236,29 @@ p2 = inv(iquv_obs, method='lm', max_iter=60, initial_guess=x1)
 p2 = inv_hmi(iquv_obs_hmi, method='lm', max_iter=60, initial_guess='sdo_hmi')
 ```
 
+Complete runnable versions of both recipes are in
+`src/CuSP/examples/inversion_random_cmaes_lm.py` and
+`src/CuSP/examples/inversion_pi2nn_lm.py`.
+
 Measured on the HMI spectrum of section 6 (one pixel, CPU, `chi2/dof`):
 
 | starting point | first stage | after `lm` | total time |
 |---|---|---|---|
-| random | `lm` alone | 2.12 → 2.12 (**no progress**) | 22 s |
-| random | `cmaes`, 200 generations | 1.41e-1 → 1.41e-1 | 22 s |
-| random | `annealing`, 100 steps (`initial_temp=0.1`) | 6.40e-2 → **2.2e-13** | 35 s |
-| PI2NN (`'sdo_hmi'`) | – | 6.90e-2 → **4.1e-13** | 18 s |
+| random | `lm` alone | 2.12 → 2.12 (**no progress**) | 15 s |
+| random | `cmaes`, 200 generations | 1.40e-1 → **4.2e-13** | 16 s |
+| random | `annealing`, 100 steps (`initial_temp=0.1`) | 6.40e-2 → **2.2e-13** | 30 s |
+| PI2NN (`'sdo_hmi'`) | – | 6.90e-2 → **3.7e-13** | 15 s |
 
-Two remarks from that table:
+So both global stages put `lm` in the basin of the true solution, and the
+two-stage route costs about the same as `lm` alone.  Two notes:
 
-* `annealing → lm` is the reliable two-stage route here.  When `lm` is started
-  from the `cmaes` solution instead, its first Newton step leaves the physical
-  box and the mathematically exact fit it finds there is rejected by the box
-  projection, so nothing is gained — a plain `cmaes` run on its own already gives
-  a very good fit within seconds.
-* `cmaes` is by far the cheapest good solution per unit time (1.1 s for
-  `chi2/dof = 9.1e-6` from the PI2NN start), so for millions of pixels it is the
+* the global stage must be allowed to explore: the CMA-ES class default
+  (population 10) stalls at `chi2/dof ≈ 0.13` from a random start, which `lm`
+  then cannot improve.  `CuSP.me_inverters.run_cmaes` therefore defaults to
+  `pop_size=30, bounded=False`, which is tuned for this problem (from the PI2NN
+  start it is ~20× more accurate as well);
+* `cmaes` is the cheapest good solution per unit time (1.1 s for
+  `chi2/dof = 4.9e-7` from the PI2NN start), so for millions of pixels it is the
   natural first pass, with `lm` added only where the extra accuracy is needed.
 
 `iquv_obs` has shape `(B, 4, N)` (channels ordered `I, Q, U, V`, continuum
@@ -516,6 +523,8 @@ The numbers quoted above come from scripts maintained next to this repository
 | `smoke_pi2nn.py` | `PI2NN` training smoke test (both `dense_spectrum` paths) |
 | `demo_initial_guess_sdo_hmi.py` | the `initial_guess='sdo_hmi'` usage shown above |
 | `verify_readme_snippets.py` | runs every code snippet of this README verbatim, so the documented API cannot drift from the implementation |
+| `verify_two_stage_recipe.py` | the two-stage recipes (random → `cmaes`/`annealing` → `lm`) and the PI2NN → `lm` reference |
+| `check_reported_merit.py` | cross-checks that `ivs_results['e']` equals the merit of `ivs_results['x']` for every method |
 
 ## 11. Citation
 

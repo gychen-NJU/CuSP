@@ -93,7 +93,9 @@ CuSP/
     │   └── pi2nn_sdo_hmi.pkl  # 面向 SDO/HMI 训练好的 PI2NN 权重
     └── examples/
         ├── forward.ipynb    # 前向模型教程
-        └── inversion.ipynb  # 反演教程
+        ├── inversion.ipynb  # 反演教程
+        ├── inversion_random_cmaes_lm.py   # 随机初值 -> CMA-ES -> LM
+        └── inversion_pi2nn_lm.py          # PI2NN 初值 -> LM
 ```
 
 ## 4. ME 的八个参数
@@ -194,9 +196,9 @@ params = inv(iquv_obs, method='csa', max_iter=1000)
 
 | 方法 | `chi2/dof` 起点 → 终点 | 耗时 | 参数误差 |
 |---|---|---|---|
-| `annealing`（`maxiter=100`、`initial_temp=0.1`） | 6.9e-2 → 3.2e-3 | 18 s | 退化：拟合看着完美但 η₀ 偏 57% |
-| `lm`（`max_iter=60`） | 6.9e-2 → **3.7e-13** | 19 s | 精确 |
-| `cmaes`（`max_iter=200`） | 6.9e-2 → 9.1e-6 | **1.1 s** | 单参数 ≤ 9% |
+| `annealing`（`maxiter=100`、`initial_temp=0.1`） | 6.9e-2 → 3.2e-3 | 12 s | 退化：拟合看着完美但 η₀ 偏 57% |
+| `lm`（`max_iter=60`） | 6.9e-2 → **3.7e-13** | 15 s | 精确 |
+| `cmaes`（`max_iter=200`） | 6.9e-2 → 4.9e-7 | **1.1 s** | 8 个参数的中位相对误差 0.23% |
 
 若用默认的 `initial_temp=5230`，退火在本问题上**完全没有改善初值**（6.9e-2 → 6.9e-2）：
 该温度比这里的 merit 量级（`chi2/dof ≈ 1e-2`）高约 5 个数量级，几乎任何试探都被接受。
@@ -213,8 +215,8 @@ params = inv(iquv_obs, method='csa', max_iter=1000)
 import torch
 
 # —— 没有网络：先全局搜索，再用 LM 精修 ——
-p1 = inv(iquv_obs, method='annealing', maxiter=100, initial_temp=0.1)
-# p1 = inv(iquv_obs, method='cmaes', max_iter=200)      # 也可用它做全局段
+p1 = inv(iquv_obs, method='cmaes', max_iter=200)
+# p1 = inv(iquv_obs, method='annealing', maxiter=100, initial_temp=0.1)
 x1 = inv.normalizing_parameter(torch.as_tensor(p1))     # 换回归一化 [0,1]^8
 p2 = inv(iquv_obs, method='lm', max_iter=60, initial_guess=x1)
 
@@ -223,21 +225,25 @@ p2 = inv(iquv_obs, method='lm', max_iter=60, initial_guess=x1)
 p2 = inv_hmi(iquv_obs_hmi, method='lm', max_iter=60, initial_guess='sdo_hmi')
 ```
 
+两条路线的完整可运行版本见 `src/CuSP/examples/inversion_random_cmaes_lm.py` 与
+`src/CuSP/examples/inversion_pi2nn_lm.py`。
+
 在第 6 节那条 HMI 光谱上实测（单像素、CPU，`chi2/dof`）：
 
 | 初猜 | 第一段 | 接 `lm` 之后 | 总耗时 |
 |---|---|---|---|
-| 随机 | 只用 `lm` | 2.12 → 2.12（**无进展**） | 22 s |
-| 随机 | `cmaes`，200 代 | 1.41e-1 → 1.41e-1 | 22 s |
-| 随机 | `annealing`，100 步（`initial_temp=0.1`） | 6.40e-2 → **2.2e-13** | 35 s |
-| PI2NN（`'sdo_hmi'`） | – | 6.90e-2 → **4.1e-13** | 18 s |
+| 随机 | 只用 `lm` | 2.12 → 2.12（**无进展**） | 15 s |
+| 随机 | `cmaes`，200 代 | 1.40e-1 → **4.2e-13** | 16 s |
+| 随机 | `annealing`，100 步（`initial_temp=0.1`） | 6.40e-2 → **2.2e-13** | 30 s |
+| PI2NN（`'sdo_hmi'`） | – | 6.90e-2 → **3.7e-13** | 15 s |
 
-由此有两点提醒：
+可见两个全局方法都能把 `lm` 送进真解所在的盆地，两段式总耗时与单跑 `lm` 相当。
+两点注意：
 
-* 这里 `annealing → lm` 是可靠的两段式路线。若把 `lm` 接到 `cmaes` 的解上，它的
-  第一步牛顿步会跨出物理盒，落在外面的"精确解"又被盒投影reject掉，于是没有收益
-  ——而单独一次 `cmaes` 已经能在 1 秒多内给出很好的拟合。
-* `cmaes` 的单位时间性价比最高（从 PI2NN 初猜出发 1.1 s 就到 `chi2/dof = 9.1e-6`），
+* 全局段必须给够探索能力：CMA-ES 的类默认种群（10）从随机初值出发会卡在
+  `chi2/dof ≈ 0.13`，`lm` 也就无从改进。因此 `CuSP.me_inverters.run_cmaes` 的默认
+  改为 `pop_size=30, bounded=False`（针对本问题调过；从 PI2NN 初值出发也准约 20 倍）。
+* `cmaes` 的单位时间性价比最高（从 PI2NN 初猜出发 1.1 s 就到 `chi2/dof = 4.9e-7`），
   因此上百万像素时适合做第一遍，再对需要更高精度的地方补 `lm`。
 
 `iquv_obs` 形状为 `(B, 4, N)`（通道顺序 `I, Q, U, V`，连续谱归一化，即
@@ -480,6 +486,8 @@ visit, accept, no_local_search)`，以及 `GSA`、`VisitDistribution`、`EnergyS
 | `smoke_pi2nn.py` | `PI2NN` 训练冒烟测试（`dense_spectrum` 两条路径） |
 | `demo_initial_guess_sdo_hmi.py` | 上文 `initial_guess='sdo_hmi'` 的用法演示 |
 | `verify_readme_snippets.py` | 把本 README 里的每段代码原样跑一遍，保证文档里的 API 不会与实现脱节 |
+| `verify_two_stage_recipe.py` | 两段式路线（随机 → `cmaes`/`annealing` → `lm`）与 PI2NN → `lm` 参照 |
+| `check_reported_merit.py` | 交叉核对每种方法的 `ivs_results['e']` 是否等于 `ivs_results['x']` 的 merit |
 
 ## 11. 引用
 

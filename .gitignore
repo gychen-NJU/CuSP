@@ -20,3 +20,7 @@ env/
 *.egg-info/
 dist/
 build/
+
+# 示例脚本生成的图片（只提交代码，不提交产物）
+examples/*.png
+src/CuSP/examples/*.png
